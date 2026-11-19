@@ -3,21 +3,30 @@
 # their priority and queue wait, your usage, how busy the GPU partitions are, and your storage.
 #   INTERVAL: 1s to 1h, as 30, 30s, 5m or 1h (default 1m).
 #   --once: print one screen and exit.
-#   --log: add the daily usage line if one is due, and exit (for cron).
-# Keys: 1-5 show or hide a panel · t next theme · c compact on/off · l layout · h help ·
-#   r refresh · q quit
+#   --log: log the energy of your own machines, add the daily usage line if one is due, and
+#     exit (for cron, such as every hour).
+# Keys: 1-6 show or hide a panel · t next theme · c compact on/off · l layout · h help ·
+#   r refresh · q quit. When a panel's rows do not all fit in the window, they scroll:
+#   Tab / Shift+Tab select the next / previous panel, and ↑↓, PgUp/PgDn and Home/End scroll it;
+#   the mouse wheel scrolls the panel under the pointer, and a click selects it.
+#   f and / filter the job list of the selected panel (my usage: its finished jobs; any other
+#   panel: my jobs): f by state (running, pending; completed, failed, cancelled), / by text in
+#   the job ID, name, partition or node, applied as it is typed (Enter keeps it, Esc clears it).
 # Panels (* = shown by default):
 #   1 my jobs*: the queue, how efficiently running jobs use what they were given, priority
-#   2 my usage*: CPU- and GPU-hours, finished-job efficiency, why jobs failed
+#   2 my usage*: CPU- and GPU-hours, finished-job efficiency, why jobs failed, cost estimate
 #   3 GPU partitions*: GPUs in use, jobs waiting, time limits, how long your jobs waited
 #   4 limits: accounts and QoS   5 storage*
+#   6 my nodes*: your own GPU machines (SLURMTOP_MYNODES): use, memory, power, processes
 # Layout: auto puts the panels in two columns when the window is at least 181 columns wide
 #   (each panel goes to the shorter column; my jobs keeps the full width, and my usage comes
 #   as two cards, usage and failed jobs, that take a column each when it is wide enough for
 #   their tables), and stacks them otherwise; l switches between auto, 1 and 2 columns.
+#   The panels fit the window height: the tallest give up rows first, and table headers stay.
 # Themes: default, nord, gruvbox, light (for light terminal backgrounds), mono.
 # Files: your panel, theme, compact and layout choices are kept in ~/.config/slurmtop/settings,
-#   and one line of usage a day is added to ~/.local/state/slurmtop/daily.tsv.
+#   and one line of usage a day is added to ~/.local/state/slurmtop/daily.tsv. The energy your
+#   own machines use is logged in ~/.local/state/slurmtop/power.tsv.
 # Light on the cluster: Slurm is asked at most every 30 s whatever the interval; accounting,
 #   storage, maintenance and limits every 10 min; hidden panels are not asked for, and the
 #   commands run at low priority (nice). Running-job efficiency is read every 5 min, only while
@@ -31,11 +40,41 @@
 #   SLURMTOP_ACCOUNT     account for the fair-share figure (default: all of yours)
 #   SLURMTOP_PATHS       paths on the cluster to show storage for; ~ and $USER are expanded
 #                        there (default: ~)
+#   SLURMTOP_MYNODES     your own GPU machines for panel 6: ssh host names, this machine by its
+#                        name (hostname -s) (default: none)
+# Cost estimate (the cost card of panel 2): U.S. averages; change the COST_ values below for your
+# site. Sources (November 2026):
+#   COST_WATTS  rated power per CPU core and per GPU of the cluster: AMD EPYC 9454, 290 W for 48
+#               cores; NVIDIA data sheets: A30 165 W, L40S 350 W, H100 SXM 700 W, RTX A6000 300 W,
+#               T4 70 W
+#   COST_CPUS   rated power (TDP) of the CPUs of your own machines, by the model number in their
+#               model name, such as "9454=290"; a machine whose CPU is not listed counts its GPUs
+#               only
+#   COST_PUE    data-center energy per unit of computer energy: Uptime Institute Global Data
+#               Center Survey 2026, industry average 1.52
+#   COST_KWH    dollars per kWh: EIA Electric Power Monthly, table 5.6.B, U.S. commercial
+#               average, January to August 2026 (14.04 cents)
+#   COST_CO2E   kg CO2e per MWh: EPA eGRID2023 (revision 2), U.S. total output emission rate
+#               (770.884 lb/MWh)
+#   COST_MILE   g CO2e per mile driven by an average gasoline passenger vehicle: EPA Greenhouse
+#               Gas Equivalencies Calculator (October 2024 revision)
+#   COST_RATE1, COST_RATE2  your cluster's prices in dollars per core-hour and per GPU-hour of
+#               each GPU type, shown as columns named COST_RATE1_NAME and COST_RATE2_NAME (none
+#               by default)
+#   Your own machines count their GPUs' energy as measured and their CPUs at rated power times
+#   their measured use (as in Green Algorithms, Lannelongue et al., Advanced Science 2021), without
+#   PUE.
 HOST=${SLURMTOP_HOST:-}
+MYHOSTS=${SLURMTOP_MYNODES:-}
 MIN_QUERY=30 SLOW_EVERY=600 LIVE_EVERY=300 LIVE_MAX=16
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/slurmtop-%C" -o ControlPersist=15m)
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}/slurmtop/settings
 LOGF=${XDG_STATE_HOME:-$HOME/.local/state}/slurmtop/daily.tsv
+PLOG=${LOGF%/*}/power.tsv PSTATE=${LOGF%/*}/power.last
+COST_PLACE="U.S. average" COST_PUE=1.52 COST_KWH=0.1404 COST_CO2E=349.67 COST_MILE=393
+COST_WATTS="cpu=6.04 a30=165 l40s=350 h100=700 a6000=300 t4=70"
+COST_CPUS=""
+COST_RATE1_NAME="" COST_RATE1="" COST_RATE2_NAME="" COST_RATE2=""
 
 interval=60 once=0 logmode=0
 for a in "$@"; do
@@ -56,32 +95,49 @@ if ! command -v squeue > /dev/null && [ -z "$HOST" ]; then
 fi
 
 # Panels, in screen order; ON[i] is 1 when panel i is shown.
-PNAME=("" "my jobs" "my usage" "gpu partitions" "limits" "storage")
-PFUNC=("" p_jobs p_usage p_parts p_limits p_storage p_failed)   # 6: the failed-jobs card of panel 2
+PNAME=("" "my jobs" "my usage" "gpu partitions" "limits" "storage" "my nodes")
+PFUNC=("" p_jobs p_usage p_parts p_limits p_storage p_nodes p_failed p_cost)   # 7, 8: cards of panel 2
 PHELP=("" "your jobs: state, start estimates, how running jobs use CPU, memory and GPUs, priority" \
-  "CPU- and GPU-hours by period, job states, efficiency of finished jobs, why jobs failed this month" \
+  "CPU- and GPU-hours by period, job states, efficiency of finished jobs, why jobs failed, cost estimate" \
   "GPUs in use, free and down, jobs waiting, time limits, your median wait, and why nodes are down" \
   "time and size limits of your accounts and QoS" \
-  "space used on your storage paths")
-ON=(0 1 1 1 0 1)
+  "space used on your storage paths" \
+  "your own GPU machines (SLURMTOP_MYNODES): use, memory, measured power and processes of each GPU")
+ON=(0 1 1 1 0 1 1)
 THEMES="default nord gruvbox light mono" THEME=default COMPACT=0 LAYOUT=auto COLMIN=90
+# Scrolling: panels are cut to fit the window; the rows between a panel's STICKY line (after its
+# table header) and its FOOT line (before its closing notes, if any) scroll. FOCUS is the panel
+# the keys scroll, OFF[i] the first scrolled row shown of panel i, GEO where each panel is on the
+# screen (for the mouse). BLK caches the rendered panels.
+FOCUS=1 STICKY=$'\x1f' FOOT=$'\x1e' DATAV=0 BLKSIG="" BLKFOC=""
+# Filters (f, /) of the selected job list: the state and the text my jobs (JF, JT) and the
+# finished jobs of my usage (FF, FT) are shown for. PROMPT replaces the key hint while a text
+# filter is typed.
+JF=all JT="" FF=all FT="" PROMPT="" SIG1="" SIG2=""
+declare -a OFF=(0 0 0 0 0 0 0 0 0) GEO=()
+declare -A BLK=() NAT=() SCR=()
 
 load_settings() {
-  local k v i
+  local k v i list="" seen=0 known=5
   [ -r "$CONF" ] || return 0
   while IFS='=' read -r k v; do
     case "$k" in
-      panels) ON=(0 0 0 0 0 0); for i in $v; do [[ $i =~ ^[1-5]$ ]] && ON[i]=1; done ;;
+      panels) list=$v seen=1 ;;
+      panelcount) [[ $v =~ ^[0-9]+$ ]] && known=$v ;;   # panels there were when the file was written
       theme) case " $THEMES " in *" $v "*) THEME=$v ;; esac ;;
       compact) [ "$v" = 1 ] && COMPACT=1 || COMPACT=0 ;;
       layout) case "$v" in auto|1|2) LAYOUT=$v ;; esac ;;
     esac
   done < "$CONF"
+  if (( seen )); then   # panels added since the file was written keep their default
+    for (( i = 1; i <= known && i <= 6; i++ )); do ON[i]=0; done
+    for i in $list; do [[ $i =~ ^[1-6]$ ]] && ON[i]=1; done
+  fi
 }
 save_settings() {
   local i list=""
-  for i in 1 2 3 4 5; do (( ON[i] )) && list+="$i "; done
-  mkdir -p "${CONF%/*}" 2>/dev/null && printf '%s\npanels=%s\ntheme=%s\ncompact=%s\nlayout=%s\n' \
+  for i in 1 2 3 4 5 6; do (( ON[i] )) && list+="$i "; done
+  mkdir -p "${CONF%/*}" 2>/dev/null && printf '%s\npanels=%s\npanelcount=6\ntheme=%s\ncompact=%s\nlayout=%s\n' \
     "# slurmtop settings; slurmtop rewrites this file when you change them with its keys" \
     "${list% }" "$THEME" "$COMPACT" "$LAYOUT" > "$CONF"
 }
@@ -102,18 +158,18 @@ if [ -t 1 ] && [ "$ncolors" -ge 8 ]; then
   color=1 T_BOLD=$(tput bold) T_DIM=$(tput dim) T_RED=$(tput setaf 1) T_GRN=$(tput setaf 2) T_YEL=$(tput setaf 3) T_CYN=$(tput setaf 6)
 fi
 [ "$(locale charmap 2>/dev/null)" = UTF-8 ] && utf8=1
-palette() {  # 256-color codes: 10 meter colors (green to red) | dim label title down green yellow | panels 1-5
+palette() {  # 256-color codes: 10 meter colors (green to red) | dim label title down green yellow | panels 1-6
   case "$1" in
-    nord)    echo "108 108 109 110 152 187 180 173 167 131|238 246 255 137 108 180|110 67 146 103 139" ;;
-    gruvbox) echo "106 142 142 148 184 214 208 166 167 124|237 246 229 130 142 214|108 109 175 132 208" ;;
-    light)   echo "28 34 70 106 142 178 172 166 160 124|252 242 232 130 28 136|30 25 61 60 131" ;;
-    *)       echo "41 77 113 149 185 221 215 209 203 197|237 245 231 136 41 221|72 110 104 146 174" ;;
+    nord)    echo "108 108 109 110 152 187 180 173 167 131|238 246 255 137 108 180|110 67 146 103 139 108" ;;
+    gruvbox) echo "106 142 142 148 184 214 208 166 167 124|237 246 229 130 142 214|108 109 175 132 208 142" ;;
+    light)   echo "28 34 70 106 142 178 172 166 160 124|252 242 232 130 28 136|30 25 61 60 131 94" ;;
+    *)       echo "41 77 113 149 185 221 215 209 203 197|237 245 231 136 41 221|72 110 104 146 174 180" ;;
   esac
 }
 apply_theme() {  # sets the colors and meter glyphs for THEME
   local meters marks boxes c c_off c_lbl c_title c_down c_grn c_yel
-  B= D= R= GRN= YEL= FG_OFF= FG_LBL= FG_TITLE= DOWNC=
-  GC=("" "" "" "" "" "" "" "" "" ""); BOXC=("" "" "" "" "" "")
+  B= D= R= GRN= YEL= FG_OFF= FG_LBL= FG_TITLE= FG_FOCUS= DOWNC=
+  GC=("" "" "" "" "" "" "" "" "" ""); BOXC=("" "" "" "" "" "" "")
   if (( color )); then
     B=$T_BOLD D=$T_DIM R=$'\e[0m'
     if [ "$THEME" = mono ]; then FG_OFF=$D FG_LBL=$D FG_TITLE=$B
@@ -127,10 +183,11 @@ apply_theme() {  # sets the colors and meter glyphs for THEME
     else
       GRN=$T_GRN YEL=$T_YEL FG_OFF=$D FG_LBL=$D FG_TITLE=$B DOWNC=$T_YEL
       GC=("$GRN" "$GRN" "$GRN" "$GRN" "$YEL" "$YEL" "$YEL" "$T_RED" "$T_RED" "$T_RED")
-      BOXC=("" "$T_CYN" "$T_CYN" "$T_CYN" "$T_CYN" "$T_CYN")
+      BOXC=("" "$T_CYN" "$T_CYN" "$T_CYN" "$T_CYN" "$T_CYN" "$T_CYN")
     fi
+    FG_FOCUS=$FG_TITLE   # the frame of the focused panel: bold, in the title color
   fi
-  BOXC[6]=${BOXC[2]}   # the failed-jobs card has the color of panel 2
+  BOXC[7]=${BOXC[2]} BOXC[8]=${BOXC[2]}   # the failed-jobs and cost cards have the color of panel 2
   # Glyphs: colored meters tell used/down/free apart by color, plain ones by shape.
   if (( utf8 )); then
     TL="╭" TR="╮" BL="╰" BRC="╯" V="│" H="─" LT="┤" RT="├"
@@ -154,31 +211,39 @@ bar() {  # bar WIDTH USED DOWN TOTAL : used (gradient) | down (amber) | free (da
   printf '%s%s' "$s" "$R"
 }
 
-vis() {  # vis TEXT: TEXT without color codes
-  local s=$1 re=$'\e''(\[[0-9;]*m|\(B)'
-  while [[ $s =~ $re ]]; do s=${s/"${BASH_REMATCH[0]}"/}; done
-  printf '%s' "$s"
+# vis and fitc print their result; vis_v and fitc_v put it into VIS and FIT instead, which
+# saves a subshell for each line drawn.
+vis_v() {  # vis_v TEXT: TEXT without color codes
+  local re=$'\e''(\[[0-9;]*m|\(B)'
+  VIS=$1
+  while [[ $VIS =~ $re ]]; do VIS=${VIS/"${BASH_REMATCH[0]}"/}; done
 }
+vis() { vis_v "$1"; printf '%s' "$VIS"; }
 
-fitc() {  # fitc TEXT WIDTH: TEXT padded or cut (with …) to WIDTH visible columns, colors kept
-  local s=$1 w=$2 plain out="" n=0 esc=$'^(\e\\[[0-9;]*m|\e\\(B)'
-  plain=$(vis "$s")
-  if (( ${#plain} <= w )); then printf '%s%*s' "$s" $(( w - ${#plain} )) ''; return 0; fi
+fitc_v() {  # fitc_v TEXT WIDTH: TEXT padded or cut (with …) to WIDTH visible columns, colors kept
+  local s=$1 w=$2 out="" n=0 esc=$'^(\e\\[[0-9;]*m|\e\\(B)'
+  vis_v "$s"
+  if (( ${#VIS} <= w )); then printf -v FIT '%s%*s' "$s" $(( w - ${#VIS} )) ''; return 0; fi
   while (( n < w - 1 )) && [[ -n $s ]]; do
     if [[ $s =~ $esc ]]; then out+=${BASH_REMATCH[1]}; s=${s:${#BASH_REMATCH[1]}}
     else out+=${s:0:1}; s=${s:1}; n=$(( n + 1 )); fi
   done
-  printf '%s%s…' "$out" "$R"
+  FIT="$out$R…"
 }
+fitc() { fitc_v "$1" "$2"; printf '%s' "$FIT"; }
 
 repeat() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }
 
 # Panels: box_top COLOR LEFT [RIGHT] draws "╭─┤ LEFT ├────┤ RIGHT ├─╮" and sets the panel
-# color; box_line TEXT draws one row (cut to fit); box_bottom [HINT] closes the panel. In
-# compact mode a panel is a title line and indented rows, without a frame.
+# color (the focus color for the focused panel, CURP being the panel drawn); box_line TEXT
+# draws one row (cut to fit), or passes STICKY and FOOT on; box_bottom [HINT] [RIGHT] closes the panel.
+# In compact mode a panel is a title line and indented rows, without a frame.
 box_top() {
   BC=$1
   local l=$2 r=${3:-} n lv
+  if (( ${CURP:-0} == FOCUS && ! once )); then   # the focused panel: highlighted frame, or a mark without colors
+    if [ -n "$FG_FOCUS" ]; then BC=$FG_FOCUS; else l="> $l"; fi
+  fi
   if (( COMPACT )); then printf '%s\n' "$(fitc "$BC$H$H$R $FG_TITLE$l$R${r:+  $FG_LBL$r$R}" "$cols")"; return; fi
   lv=$(vis "$l"); n=$(( cols - 7 - ${#lv} ))
   if [ -n "$r" ]; then lv=$(vis "$r"); n=$(( n - 5 - ${#lv} )); fi
@@ -188,19 +253,29 @@ box_top() {
   printf '%s%s\n' "$TR" "$R"
 }
 box_line() {
-  if (( COMPACT )); then printf '   %s\n' "$(fitc "$1" $(( cols - 3 )))"; return; fi
-  printf '%s%s%s %s %s%s%s\n' "$BC" "$V" "$R" "$(fitc "$1" $(( cols - 4 )))" "$BC" "$V" "$R"
+  [[ $1 == "$STICKY" || $1 == "$FOOT" ]] && { printf '%s\n' "$1"; return; }   # the rows above / below stay put when the panel scrolls
+  if (( COMPACT )); then fitc_v "$1" $(( cols - 3 )); printf '   %s\n' "$FIT"; return; fi
+  fitc_v "$1" $(( cols - 4 )); printf '%s%s%s %s %s%s%s\n' "$BC" "$V" "$R" "$FIT" "$BC" "$V" "$R"
 }
 box_lines() { local l; while IFS= read -r l; do box_line "$l"; done; }   # box_line for each input line
-box_bottom() {
-  local h=${1:-} n hv
+box_bottom() {  # HINT (the keys) on the left, RIGHT (which rows are shown) on the right
+  local h=${1:-} r=${2:-} n v
   if (( COMPACT )); then [ -n "$h" ] && printf '%s\n' "$(fitc "$FG_LBL$h$R" "$cols")"; return 0; fi
-  if [ -n "$h" ]; then
-    hv=$(vis "$h"); n=$(( cols - 7 - ${#hv} )); (( n < 1 )) && n=1
-    printf '%s%s%s%s %s%s%s%s %s%s%s%s\n' "$BC" "$BL" "$H" "$LT" "$FG_LBL" "$h" "$R" "$BC" "$RT" "$(repeat "$H" "$n")" "$BRC" "$R"
-  else
-    printf '%s%s%s%s%s\n' "$BC" "$BL" "$(repeat "$H" $(( cols - 2 )))" "$BRC" "$R"
+  n=$(( cols - 2 ))
+  [ -n "$r" ] && { v=$(vis "$r"); n=$(( n - 5 - ${#v} )); }
+  if [ -n "$h" ]; then   # the hint is cut to the room left (at least one line after it)
+    v=$(vis "$h")
+    if (( ${#v} > n - 6 )); then
+      if (( n - 6 >= 4 )); then h=$(fitc "$h" $(( n - 6 ))); v=$(vis "$h"); else h=""; fi
+    fi
+    [ -n "$h" ] && n=$(( n - 5 - ${#v} ))
   fi
+  (( n < 1 )) && n=1
+  printf '%s%s' "$BC" "$BL"
+  [ -n "$h" ] && printf '%s%s %s%s%s%s %s' "$H" "$LT" "$FG_LBL" "$h" "$R" "$BC" "$RT"
+  printf '%s' "$(repeat "$H" "$n")"
+  [ -n "$r" ] && printf '%s %s%s%s%s %s%s' "$LT" "$FG_LBL" "$r" "$R" "$BC" "$RT" "$H"
+  printf '%s%s\n' "$BRC" "$R"
 }
 ptitle() { printf '%s%s%s%s %s' "$FG_LBL" "$1" "$R" "$FG_TITLE" "${2:-${PNAME[$1]}}"; }   # "3 gpu partitions", or ptitle 2 NAME
 
@@ -231,7 +306,31 @@ function gpus(tres,   n, rest, t, kv) {  # GPUs in an AllocTRES string; per type
     split(t, kv, "="); TY[++NT] = kv[1]; TN[NT] = kv[2] + 0
   }
   return n }
+function cpuw(m, n,   x, y, i, k) {  # rated power of n CPUs of model m, from CPUS (COST_CPUS); 0 if not there
+  m = tolower(m); k = split(CPUS, x, " ")
+  for (i = 1; i <= k; i++) if (split(x[i], y, "=") == 2 && index(m, tolower(y[1]))) return y[2] * n
+  return 0 }
+function periods(W,   w) {  # the periods of my usage, from the @@WINDOWS line: NP of them, start PS, label PL
+  split(W, w, " "); NOW = w[1]; NP = 7
+  PS[1] = NOW - 3600;        PL[1] = "last hour"
+  PS[2] = NOW - 86400;       PL[2] = "last 24 hours"
+  PS[3] = w[3];              PL[3] = "last 7 days"
+  PS[4] = NOW - 30 * 86400;  PL[4] = "last 30 days"
+  PS[5] = NOW - 365 * 86400; PL[5] = "last 365 days"
+  PS[6] = w[4];              PL[6] = "since " w[6]
+  PS[7] = w[5];              PL[7] = "since " w[7] }
 '
+
+# squeue rows -> the header and the rows that pass the filters of my jobs: JF (all, running or
+# pending) and JT (text in the job ID, name, partition or nodes/reason, in any case).
+job_filter() {
+  JTX=$JT awk -F'|' -v S="$JF" '
+    BEGIN { T = tolower(ENVIRON["JTX"]) }
+    NR == 1 || NF < 12 { print; next }
+    S == "running" && $4 !~ /^(R|CG|CF)$/ || S == "pending" && $4 != "PD" { next }
+    T != "" && index(tolower($1 " " $2 " " $3 " " $12), T) == 0 { next }
+    { print }'
+}
 
 # squeue rows "a|b|..." -> columns just as wide as their content, numbers right-aligned,
 # state colored, two spaces between columns (one if that does not fit in MAXW, and the least
@@ -297,6 +396,7 @@ jobs_table() {
           out = out (c != "" ? c sprintf(f, v) R : sprintf(f, v)) (i < 16 ? gap : "")
         }
         print out (hdr[r] ? R : "")
+        if (hdr[r]) print "\037"   # STICKY: the header stays put when the rows scroll
       }
     }'
 }
@@ -319,14 +419,13 @@ wait_lines() {
 
 # sacct rows "JobID|Start|End|NCPUS|AllocTRES" (times in epoch seconds) and the line
 # "NOW HOUR WEEK MONTH YEAR MONTHDATE YEARDATE" from @@WINDOWS -> CPU-hours, GPU-hours (also by
-# GPU type) and jobs that ran, for the last hour, the last 7 days, this month and this year.
+# GPU type) and jobs that ran, for the last hour, 24 hours, 7, 30 and 365 days, this month and
+# this year.
 # Each job counts only for the part of its run inside the period; running jobs count up to now.
 period_lines() {
   awk -F'|' -v D="$FG_LBL" -v R="$R" -v B="$B" -v W="$1" "$AWK_FN"'
     function h(x) { return x < 100 ? sprintf("%.1f", x) : sprintf("%.0f", x) }   # hours, one decimal below 100
-    BEGIN { split(W, w, " "); now = w[1]; nw = 4
-            start[1] = w[2]; label[1] = "last hour"; start[2] = w[3]; label[2] = "last 7 days"
-            start[3] = w[4]; label[3] = "since " w[6]; start[4] = w[5]; label[4] = "since " w[7] }
+    BEGIN { periods(W); now = NOW; nw = NP; for (i = 1; i <= NP; i++) { start[i] = PS[i]; label[i] = PL[i] } }
     $2 ~ /^[0-9]+$/ {
       e = ($3 ~ /^[0-9]+$/) ? $3 : now; gpu = gpus($5)
       for (k = 1; k <= NT; k++) if (!(TY[k] in known)) { known[TY[k]] = 1; types[++ntypes] = TY[k] }
@@ -349,11 +448,13 @@ period_lines() {
 # (jobs and their steps) -> your jobs counted by state, how much of the allocated CPU time,
 # the requested memory (at peak) and the time limit finished jobs used, and the latest $3
 # finished jobs. $1 is the period, such as "since 2026-11-01", and $2 its start (epoch); jobs
-# that ended before it are left out. Like seff; GPU use is not covered.
+# that ended before it are left out. Like seff; GPU use is not covered. The list has only the
+# jobs in state $4 (all, completed, failed or cancelled) whose ID or name has the text $FTX.
 usage_lines() {
-  awk -F'|' -v D="$FG_LBL" -v R="$R" -v Y="$YEL" -v SINCE="$1" -v MS="$2" -v ROWS="$3" "$AWK_FN"'
+  awk -F'|' -v D="$FG_LBL" -v R="$R" -v Y="$YEL" -v SINCE="$1" -v MS="$2" -v ROWS="$3" -v FST="${4:-all}" "$AWK_FN"'
+    BEGIN { FTX = tolower(ENVIRON["FTX"]) }
     $1 !~ /\./ { id = $1; if ($11 ~ /^[0-9]+$/ && $11 < MS) { skip[id] = 1; next }
-                 ids[++n] = id; st = $3; sub(/ .*/, "", st); state[id] = st; name[id] = substr($2, 1, 12)
+                 ids[++n] = id; st = $3; sub(/ .*/, "", st); state[id] = st; name[id] = substr($2, 1, 12); full[id] = $2
                  elr[id] = $4; limr[id] = $5; el[id] = secs($4); lim[id] = secs($5); ncpu[id] = $6; cpu[id] = secs($8)
                  req[id] = bytes($7) * ($7 ~ /c$/ ? $6 : 1); next }
     $9 != "" { id = $1; sub(/\..*/, "", id); if (id in skip) next; r = bytes($9); has[id] = 1; if (r > rss[id]) rss[id] = r }
@@ -361,7 +462,8 @@ usage_lines() {
       ended = " COMPLETED FAILED TIMEOUT OUT_OF_MEMORY CANCELLED NODE_FAIL PREEMPTED BOOT_FAIL DEADLINE "
       for (i = 1; i <= n; i++) {
         id = ids[i]; cnt[state[id]]++
-        if (index(ended, " " state[id] " ") == 0 || el[id] <= 0) continue   # still waiting or running, or never ran
+        if (index(ended, " " state[id] " ") == 0) continue   # still waiting or running
+        fin[++nf] = id; if (el[id] <= 0) continue             # never ran
         last[++m] = id; core += el[id] * ncpu[id]; used += cpu[id]
         if (req[id] > 0 && has[id]) { mreq += req[id]; mrss += rss[id] }
         if (lim[id] > 0) { tl += lim[id]; te += el[id] }
@@ -375,9 +477,19 @@ usage_lines() {
       print D "finished jobs used, of what they asked for:" R " CPU " cell(used, core, 1) D " ·" R " memory " cell(mrss, mreq, 1) \
         D " (peak) ·" R " time " cell(te, tl, 1)
       if (ROWS <= 0) exit
+      flt = (FST != "all" || FTX != ""); k = flt ? nf : m
+      for (i = 1; i <= k; i++) {   # the finished jobs that pass the filters; filtered, also those that never ran
+        id = flt ? fin[i] : last[i]; s = state[id]
+        if (FST == "completed" && s != "COMPLETED" || FST == "cancelled" && s != "CANCELLED" ||
+            FST == "failed" && s !~ /^(FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|BOOT_FAIL|DEADLINE|PREEMPTED)$/) continue
+        if (FTX != "" && index(tolower(id " " full[id]), FTX) == 0) continue
+        sel[++ns] = id
+      }
+      if (!ns) { print D "(no finished job matches the filter)" R; exit }
       printf "%s%-12s %-12s %-9s %10s %10s %4s %4s %13s %4s%s\n", D, "JOBID", "NAME", "STATE", "ELAPSED", "LIMIT", "CPUS", "CPU%", "MEM PEAK/REQ", "MEM%", R
-      for (i = (m > ROWS ? m - ROWS + 1 : 1); i <= m; i++) {
-        id = last[i]; s = state[id]; if (s == "OUT_OF_MEMORY") s = "OOM"
+      if (flt) print "\037"   # STICKY: a filtered list can be long, and scrolls under its header
+      for (i = (ns > ROWS ? ns - ROWS + 1 : 1); i <= ns; i++) {
+        id = sel[i]; s = state[id]; if (s == "OUT_OF_MEMORY") s = "OOM"
         mem = has[id] ? sprintf("%.1fG/%.1fG", rss[id] / 1073741824, req[id] / 1073741824) : "-"
         printf "%-12s %-12s %-9s %10s %10s %4s %s %13s %s\n", id, name[id], s, elr[id], limr[id], ncpu[id], \
           cell(cpu[id], el[id] * ncpu[id], 4), mem, (has[id] ? cell(rss[id], req[id], 4) : sprintf("%4s", "-"))
@@ -386,12 +498,15 @@ usage_lines() {
 }
 
 # The same sacct rows as usage_lines -> your failed jobs of the period, grouped by cause, and
-# the latest $4 of them. $1 is the period, $2 its start and $3 now (epoch seconds).
+# the latest $4 of them. $1 is the period, $2 its start and $3 now (epoch seconds). Only jobs
+# whose ID or name has the text $FTX count.
 fail_lines() {
   awk -F'|' -v D="$FG_LBL" -v R="$R" -v Y="$YEL" -v B="$B" -v SINCE="$1" -v MS="$2" -v NOW="$3" -v ROWS="$4" "$AWK_FN"'
+    BEGIN { FTX = tolower(ENVIRON["FTX"]) }
     $1 !~ /\./ && !($11 ~ /^[0-9]+$/ && $11 < MS) {
       st = $3; sub(/ .*/, "", st)
       if (st !~ /^(FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|BOOT_FAIL|DEADLINE|PREEMPTED)$/) next
+      if (FTX != "" && index(tolower($1 " " $2), FTX) == 0) next
       split($10, ec, ":"); code = ec[1] + 0; sig = ec[2] + 0
       if (st == "FAILED") why = sig ? "killed by signal " sig : "exit code " code ": the program stopped with an error (see its output file)"
       else if (st == "TIMEOUT") why = "reached the time limit"
@@ -404,7 +519,7 @@ fail_lines() {
       fexit[f] = sig ? "sig " sig : code; fel[f] = $4; fend[f] = ($11 ~ /^[0-9]+$/) ? $11 + 0 : 0
     }
     END {
-      if (!f) { print D "(no failed jobs " SINCE ")" R; exit }
+      if (!f) { print D (FTX != "" ? "(no failed job matches the filter)" : "(no failed jobs " SINCE ")") R; exit }
       for (i = 1; i <= nw; i++) printf "%s%4d %-8s%s %s\n", B, cnt[whys[i]], wst[whys[i]], R, whys[i]
       if (ROWS <= 0) exit
       for (r = 1; r <= ROWS && r <= f; r++) {   # the ROWS that ended last, latest at the bottom
@@ -522,7 +637,7 @@ if has slow; then   # Slurm accounting (slurmdbd), storage and maintenance, ever
   now=$(date +%s) month=$(date +%Y-%m-01) year=$(date +%Y-01-01)
   fstart=$month; [ "$(date +%d)" = 01 ] && fstart=now-1days   # the daily log needs the last 24 h
   echo "@@WINDOWS"; echo "$now $(( now - 3600 )) $(( now - 7 * 86400 )) $(date -d "$month" +%s) $(date -d "$year" +%s) $month $year"
-  echo "@@USAGE"; SLURM_TIME_FORMAT=%s timeout 30 sacct -u "$USER" -X -n -P -S "$year" -E now -o JobID,Start,End,NCPUS,AllocTRES,Partition,Eligible 2>/dev/null
+  echo "@@USAGE"; SLURM_TIME_FORMAT=%s timeout 30 sacct -u "$USER" -X -n -P -S now-365days -E now -o JobID,Start,End,NCPUS,AllocTRES,Partition,Eligible 2>/dev/null
   echo "@@FINISHED"; SLURM_TIME_FORMAT=%s timeout 30 sacct -u "$USER" -n -P -S "$fstart" -E now -o JobID,JobName,State,Elapsed,Timelimit,NCPUS,ReqMem,TotalCPU,MaxRSS,ExitCode,End 2>/dev/null
   echo "@@STORAGE"
   for p in $PATHS; do
@@ -553,6 +668,104 @@ fi
 echo "@@END"
 EOF
 section() { awk -v S="@@$1" '$0 == S {on = 1; next} /^@@[A-Z]+$/ {on = 0} on' <<< "$RAW"; }
+
+# Your own machines (panel 6), read with nvidia-smi: probe_nodes prints @@MYGPUS and, for each
+# machine, "#H HOST TIME", its GPU lines ("BUS, INDEX, NAME, USE %, MEMORY USED MiB, MEMORY MiB,
+# POWER W, POWER LIMIT W"), "#P", a line per GPU process ("BUS|MEMORY MiB|USER|COMMAND"), and
+# "#E BOOT GPU-MJ CPU-BUSY CPU-ALL SOCKETS MODEL": when the machine started, the energy its GPUs
+# used since then (the driver's energy counters, read through NVML; "-" without them), the CPU
+# time since then (busy and all, in clock ticks), and its CPUs. The machines are read at the same
+# time, through ssh except this one.
+MYPROBE='nvidia-smi --query-gpu=pci.bus_id,index,name,utilization.gpu,memory.used,memory.total,power.draw,power.limit --format=csv,noheader,nounits 2>&1
+echo "#P"
+nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_memory --format=csv,noheader,nounits 2>/dev/null |
+  while IFS=", " read -r b p m; do printf "%s|%s|%s|%s\n" "$b" "$m" "$(ps -o user= -p "$p")" "$(ps -o comm= -p "$p")"; done
+e=$(python3 - 2> /dev/null <<"PY"
+import ctypes as c
+n = c.CDLL("libnvidia-ml.so.1"); k = c.c_uint(); s = 0
+if n.nvmlInit_v2() or n.nvmlDeviceGetCount_v2(c.byref(k)): raise SystemExit
+for i in range(k.value):
+    h, e = c.c_void_p(), c.c_ulonglong()
+    if n.nvmlDeviceGetHandleByIndex_v2(i, c.byref(h)) or n.nvmlDeviceGetTotalEnergyConsumption(h, c.byref(e)): raise SystemExit
+    s += e.value
+print(s)
+PY
+)
+echo "#E $(awk "/^btime / {print \$2}" /proc/stat 2> /dev/null) ${e:--} $(awk "/^cpu / {b = \$2 + \$3 + \$4 + \$7 + \$8 + \$9; printf \"%.0f %.0f\", b, b + \$5 + \$6}" /proc/stat 2> /dev/null) $(awk -F ": " "/^physical id/ {p[\$2]} /^model name/ && m == \"\" {m = \$2} END {for (k in p) n++; print (n ? n : 1), m}" /proc/cpuinfo 2> /dev/null)"'
+probe_nodes() {
+  local h t me dir
+  me=$(hostname -s 2> /dev/null); dir=$(mktemp -d "${TMPDIR:-/tmp}/slurmtop.XXXXXX") || return 0
+  for h in $MYHOSTS; do
+    if [ "$h" = "$me" ] || [ "$h" = localhost ]; then bash -c "$MYPROBE" > "$dir/$h" 2>&1 &
+    else ssh -o ConnectTimeout=5 "${SSH[@]:1}" "$h" bash -s <<< "$MYPROBE" > "$dir/$h" 2>&1 &
+    fi
+  done
+  wait; t=$(date +%s)
+  echo "@@MYGPUS"
+  for h in $MYHOSTS; do echo "#H $h $t"; cat "$dir/$h"; rm -f "$dir/$h"; done
+  rmdir "$dir"
+}
+# The energy log of your own machines: PLOG has spans of time that were measured, of about an
+# hour each, as "START END HOST GPU-JOULES CPU-JOULES"; PSTATE has each machine's last reading and
+# the span still open, as "HOST TIME BOOT GPU-MJ CPU-BUSY CPU-ALL START GPU-JOULES CPU-JOULES".
+# The GPUs' energy counters give the energy between two readings however far apart they are, and
+# the first reading after a machine started also the energy since it started. GPUs without them
+# count the power of each reading for the time since the last one, when that is under two
+# refreshes. CPUs count at their rated power (COST_CPUS) times their use between the readings.
+# Readings of any slurmtop, also of --log from cron, add up: each counts from the last one.
+plock() {  # takes the log's lock (for a moment); a lock left by an ended process is taken over
+  local d="$PSTATE.lock" i p
+  for (( i = 0; i < 30; i++ )); do
+    mkdir "$d" 2> /dev/null && { echo $$ > "$d/pid"; return 0; }
+    p=$(cat "$d/pid" 2> /dev/null)
+    if [ -n "$p" ]; then kill -0 "$p" 2> /dev/null || { rm -f "$d/pid"; rmdir "$d"; } 2> /dev/null
+    elif [ -n "$(find "$d" -maxdepth 0 -mmin +1 2> /dev/null)" ]; then rmdir "$d" 2> /dev/null; fi
+    sleep 0.1
+  done
+  return 1
+}
+punlock() { rm -f "$PSTATE.lock/pid"; rmdir "$PSTATE.lock"; } 2> /dev/null
+power_sample() {  # the readings in MYDATA -> PLOG and PSTATE
+  local out gap=$(( 2 * (interval > MIN_QUERY ? interval : MIN_QUERY) + 30 ))
+  mkdir -p "${PLOG%/*}" 2> /dev/null && plock || return 0
+  out=$({ [ -r "$PSTATE" ] && cat "$PSTATE"; echo "@@"; printf '%s\n' "$MYDATA"; } | awk -v GAP="$gap" -v CPUS="$COST_CPUS" "$AWK_FN"'
+    function span(h, a, b, g, c) { if (b > a) printf "L %.0f %.0f %s %.0f %.0f\n", a, b, h, g, c }
+    function shut(h) { span(h, ss[h], t0[h], gj[h], cj[h]); ss[h] = t0[h]; gj[h] = cj[h] = 0 }   # closes the open span
+    function since(h) {   # the first reading after the machine started: the energy since it started
+      if (G ~ /^[0-9]+$/ && T > B) span(h, B, T, G / 1000, (A > 0 ? Z / A : 0) * P * (T - B)) }
+    /^@@$/ { s = 1; next }
+    !s && NF == 9 { h = $1; t0[h] = $2; bt[h] = $3; g0[h] = $4; b0[h] = $5; a0[h] = $6; ss[h] = $7; gj[h] = $8; cj[h] = $9
+                    if (!(h in seen)) { seen[h] = 1; order[++n] = h }; next }
+    !s { next }
+    /^#H / { h = $2; tm[h] = $3; w[h] = 0; next }
+    /^#E / { if ($2 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/) { e[h] = $0; got[++m] = h }; next }
+    split($0, f, /, */) >= 8 && f[7] ~ /^[0-9.]+$/ { w[h] += f[7] }
+    END {
+      for (i = 1; i <= m; i++) {
+        h = got[i]; split(e[h], x, " "); T = tm[h]; B = x[2]; G = x[3]; Z = x[4]; A = x[5]
+        mo = e[h]; sub(/^#E( +[^ ]+){5} */, "", mo); P = cpuw(mo, x[6])
+        if (!(h in seen)) { seen[h] = 1; order[++n] = h; since(h); ss[h] = T; gj[h] = cj[h] = 0 }
+        else if (T <= t0[h]) continue
+        else if (B - bt[h] > 60 || bt[h] - B > 60) { shut(h); since(h); ss[h] = T }   # restarted since: the rest is lost
+        else {
+          dt = T - t0[h]; dg = -1
+          if (G ~ /^[0-9]+$/ && g0[h] ~ /^[0-9]+$/ && G >= g0[h]) dg = (G - g0[h]) / 1000
+          else if (dt <= GAP) dg = w[h] * dt
+          if (dg < 0) { shut(h); ss[h] = T }   # not measured: the open span ends at the last reading
+          else { gj[h] += dg; cj[h] += (A > a0[h] && Z >= b0[h]) ? (Z - b0[h]) / (A - a0[h]) * P * dt : 0 }
+        }
+        t0[h] = T; bt[h] = B; g0[h] = G; b0[h] = Z; a0[h] = A
+        if (int(T / 3600) != int(ss[h] / 3600)) shut(h)   # a new hour: a new span
+      }
+      for (i = 1; i <= n; i++) { h = order[i]
+        printf "S %s %.0f %.0f %s %.0f %.0f %.0f %.0f %.0f\n", h, t0[h], bt[h], g0[h], b0[h], a0[h], ss[h], gj[h], cj[h] }
+    }')
+  if [ -n "$out" ]; then
+    awk '/^L / {print substr($0, 3)}' <<< "$out" >> "$PLOG"
+    awk '/^S / {print substr($0, 3)}' <<< "$out" > "$PSTATE.new" && mv "$PSTATE.new" "$PSTATE"
+  fi
+  punlock
+}
 got() { grep -q "^@@$1\$" <<< "$RAW"; }
 
 # One tab-separated line for the daily log: the last 24 hours of usage (as in "my usage"), and
@@ -588,21 +801,26 @@ log_line() {
         (je != "" ? je : "-"), p(used, core), p(mrss, mreq), p(te, tl), FSH, ST
     }'
 }
-write_log() {  # adds a line to the daily log when the last one is 23 hours old or more
-  [ -n "$WINDOWS" ] || return 0
-  [ -s "$LOGF" ] && [ -z "$(find "$LOGF" -mmin +1380 2>/dev/null)" ] && return 0
+log_due() { ! [ -s "$LOGF" ] || [ -n "$(find "$LOGF" -mmin +1380 2>/dev/null)" ]; }   # the last line is 23 hours old or more
+write_log() {  # adds a line to the daily log when one is due
+  [ -n "$WINDOWS" ] && log_due || return 0
   mkdir -p "${LOGF%/*}" 2>/dev/null || return 0
   [ -s "$LOGF" ] || printf 'time\tcpu_hours\tgpu_hours\tgpu_hours_by_type\tjobs_ran\tjobs_ended\tcpu_used\tmemory_used\ttime_used\tfair_share\tstorage\n' > "$LOGF"
   log_line >> "$LOGF"
 }
 
-last_query=0 last_slow=0 last_live=0 force=0 first=1
+last_query=0 last_slow=0 last_live=0 force=0 first=1 QPID="" QFILE="" QNOW=0
+# query [bg]: asks Slurm for what the shown panels need when it is due (r and newly shown panels:
+# at most every 5 s; otherwise every INTERVAL, and at most every MIN_QUERY), and reads the answer
+# (query_read). With bg the question runs in the background (QPID, answer into QFILE), so keys
+# keep working, and the main loop reads the answer when it has come (answer).
 query() {
-  local now want="" slow=0 script
+  local now want="" slow=0 script mine=0
+  [ -n "$QPID" ] && return 0   # one question at a time
   now=$(date +%s)
   if (( force )); then (( now - last_query < 5 )) && return   # r and newly shown panels: at most every 5 s
-  elif (( last_query > 0 && now - last_query < MIN_QUERY )); then return; fi
-  force=0 last_query=$now
+  elif (( last_query > 0 && now - last_query < (interval > MIN_QUERY ? interval : MIN_QUERY) )); then return; fi
+  force=0 last_query=$now QNOW=$now
   (( now - last_slow >= SLOW_EVERY )) && slow=1
   if (( logmode )); then want="prio slow"
   else
@@ -613,13 +831,30 @@ query() {
     (( slow )) && want+=" slow"
     (( ON[4] && (slow || ${#QOS} == 0) )) && want+=" limits"
     (( ON[1] && now - last_live >= LIVE_EVERY )) && want+=" live"
+    (( ON[6] )) && [ -n "$MYHOSTS" ] && mine=1   # your own machines are read at the same time
   fi
-  (( once || logmode )) || printf '%s%s%s' "$HOME_" "$(header "${YEL}updating…$R")" "$EL"  # keep the old screen, flag the wait
+  (( once || logmode )) || [ "${1:-}" = bg ] || printf '%s%s%s' "$HOME_" "$(header "${YEL}updating…$R")" "$EL"  # keep the old screen, flag the wait
   script=$(printf 'ACCOUNT=%q PARTS=%q PATHS=%q WANT=%q LIVE_MAX=%q\n' "${SLURMTOP_ACCOUNT:-}" "${SLURMTOP_PARTITIONS:-}" \
     "${SLURMTOP_PATHS:-~}" "$want" "$LIVE_MAX"; printf '%s\n' "$COLLECT")
+  if [ "${1:-}" = bg ]; then
+    if command -v squeue > /dev/null; then { nice -n 10 bash -c "$script" 2> /dev/null; (( mine )) && probe_nodes; } > "$QFILE" &
+    else { "${SSH[@]}" "$HOST" nice -n 10 bash -s <<< "$script" 2>&1; (( mine )) && probe_nodes; } > "$QFILE" &
+    fi
+    QPID=$!; return 0
+  fi
   if command -v squeue > /dev/null; then RAW=$(nice -n 10 bash -c "$script")
   else RAW=$("${SSH[@]}" "$HOST" nice -n 10 bash -s <<< "$script" 2>&1)
   fi
+  (( mine )) && RAW+=$'\n'$(probe_nodes)
+  query_read
+}
+answer() {  # when the background question has ended: reads its answer, and succeeds
+  [ -n "$QPID" ] && ! kill -0 "$QPID" 2> /dev/null || return 1
+  wait "$QPID" 2> /dev/null; QPID=""; RAW=$(< "$QFILE"); query_read; return 0
+}
+query_read() {  # Slurm's answer (RAW) -> the data the panels show
+  DATAV=$(( DATAV + 1 ))   # new data: the panels are drawn again
+  if got MYGPUS; then MYDATA=$(section MYGPUS); power_sample; fi
   if ! got END; then
     MYJOBS="(could not reach the cluster: $(head -n 2 <<< "$RAW" | tr '\n' ' '))"; return
   fi
@@ -630,12 +865,12 @@ query() {
   if got NODES; then PENDING_BY_PART=$(section PENDING); NODES=$(section NODES); fi
   if got PARTS; then PARTLIST=$(section PARTS); PARTTIME=$(section PARTTIME); fi
   if got WINDOWS; then
-    last_slow=$now; STORAGE=$(section STORAGE); WINDOWS=$(section WINDOWS); USAGE=$(section USAGE)
+    last_slow=$QNOW; STORAGE=$(section STORAGE); WINDOWS=$(section WINDOWS); USAGE=$(section USAGE)
     FINISHED=$(section FINISHED); RESV=$(section RESV)
     write_log
   fi
   if got ASSOC; then ASSOC=$(section ASSOC); QOS=$(section QOS); fi
-  if got LIVE; then last_live=$now; LIVE=$(section LIVE); fi
+  if got LIVE; then last_live=$QNOW; LIVE=$(section LIVE); fi
 }
 
 size() { cols=$(tput cols 2>/dev/null || echo 100); (( cols < 60 )) && cols=60; }
@@ -648,14 +883,22 @@ header() {  # header [STATUS]: the title line, with an optional status such as "
   printf '%s\n' "$(fitc "$FG_TITLE$l$R $FG_OFF$(repeat "$H" "$n")$R $FG_LBL$r$R" "$cols")"
 }
 
+fdesc() {  # fdesc STATE TEXT [WORD]: the filters, for a panel title: " · running", " · "pq1""
+  [ "$1" != all ] && printf '%s · %s%s' "$YEL" "$1" "${3:-}"
+  [ -n "$2" ] && printf '%s · "%s"' "$YEL" "$2"
+  return 0
+}
+
 p_jobs() {
-  local r p g fs top note="efficiency read every $(( LIVE_EVERY / 60 )) min inside running jobs"
+  local r p g fs top jobs note="efficiency read every $(( LIVE_EVERY / 60 )) min inside running jobs"
   (( last_live == 0 )) && note="reading efficiency…"
-  box_top "${BOXC[1]}" "$(ptitle 1)" "$note"
+  box_top "${BOXC[1]}" "$(ptitle 1)$(fdesc "$JF" "$JT")" "$note"
   r=$(grep -c '^RUNNING' <<< "$MYSTATES"); p=$(grep -c '^PENDING' <<< "$MYSTATES")
   g=$(grep '^RUNNING' <<< "$MYSTATES" | grep -o 'gpu[:a-z0-9]*' | awk -F: '{n += ($NF ~ /^[0-9]+$/ ? $NF : 1)} END {print n+0}')
   box_line "$(bar 20 "$r" 0 $(( r + p )))  $GRN$r$R of $(( r + p )) running · $YEL$p$R pending · $B$g$R GPUs in use"
-  jobs_table "$r" <<< "$MYJOBS" | box_lines
+  jobs=$(job_filter <<< "$MYJOBS")
+  jobs_table "$r" <<< "$jobs" | box_lines
+  [[ $jobs != *$'\n'* && $MYJOBS == *$'\n'* ]] && box_line "${FG_LBL}(no job matches the filter; f and / change it)$R"
   # fair-share, and what the priority of your highest-priority pending job is made of (sprio)
   fs=$(awk -F'|' 'NF == 2 && $1 != "" {printf "%s%s %.3f", (n++ ? " · " : ""), $1, $2}' <<< "$FS")
   top=$({ printf '%s\n' "$MYJOBS"; echo "@P"; printf '%s\n' "$PRIO"; } | awk -F'|' '
@@ -664,18 +907,20 @@ p_jobs() {
     s && ($1 in pd) && NF >= 10 && (out == "" || $4 + 0 > best) {
       best = $4 + 0; out = $1 ": priority " $4 " from fair-share " $6 ", QoS " $8 ", age " $10 }
     END { print out }')
+  box_line "$FOOT"
   box_line "${FG_LBL}fair-share$R ${fs:-?} ${FG_LBL}(1 = share unused, 0 = used up)$R"
   [ -n "$top" ] && box_line "${FG_LBL}top pending job$R $top"
   box_bottom "$HINT"
 }
 
 p_usage() {
-  local month ms
-  box_top "${BOXC[2]}" "$(ptitle 2)" "Slurm accounting, every $(( SLOW_EVERY / 60 )) min"
+  local month ms rows=$(( COMPACT ? 0 : 5 ))
+  [[ $FF != all || -n $FT ]] && rows=1000000   # filtered: all the jobs that match (the list scrolls)
+  box_top "${BOXC[2]}" "$(ptitle 2)$(fdesc "$FF" "$FT" " jobs")" "Slurm accounting, every $(( SLOW_EVERY / 60 )) min"
   if [ -n "$WINDOWS" ] && [ -n "$USAGE$FINISHED" ]; then
     period_lines "$WINDOWS" <<< "$USAGE" | box_lines
     read -r _ _ _ ms _ month _ <<< "$WINDOWS"
-    usage_lines "since $month" "$ms" "$(( COMPACT ? 0 : 5 ))" <<< "$FINISHED" | box_lines
+    FTX=$FT usage_lines "since $month" "$ms" "$rows" "$FF" <<< "$FINISHED" | box_lines
   else
     box_line "${FG_LBL}(not read yet, or Slurm accounting is not available here)$R"
   fi
@@ -685,8 +930,126 @@ p_usage() {
 p_failed() {  # the second card of panel 2; drawn only once Slurm accounting has been read
   local now ms month
   read -r now _ _ ms _ month _ <<< "$WINDOWS"
-  box_top "${BOXC[6]}" "$(ptitle 2 "failed jobs")" "since $month"
-  fail_lines "since $month" "$ms" "$now" "$(( COMPACT ? 0 : 5 ))" <<< "$FINISHED" | box_lines
+  box_top "${BOXC[7]}" "$(ptitle 2 "failed jobs")$(fdesc all "$FT")" "since $month"
+  FTX=$FT fail_lines "since $month" "$ms" "$now" "$(( COMPACT ? 0 : 5 ))" <<< "$FINISHED" | box_lines
+  box_bottom "$HINT"
+}
+
+# @U and the sacct rows of @@USAGE (as for period_lines), @P and the lines of PLOG and PSTATE (see
+# power_sample), then @M and @@MYGPUS -> for each period, the energy, electricity cost, emissions
+# and driving equivalent of your cluster jobs (CPU cores and GPUs at rated power, times the PUE),
+# and their price at COST_RATE1 and COST_RATE2 when these are set (GPU jobs per GPU-hour, CPU-only
+# jobs per core-hour); then the same for your own machines (the hosts in $3; the energy they used
+# as logged, no PUE), with the share of the period that was measured. $1 is the @@WINDOWS line,
+# $2 the time now (the periods of your own machines end then).
+cost_lines() {
+  awk -v D="$FG_LBL" -v R="$R" -v W="$1" -v TNOW="$2" -v HL="$3" -v CL="${CLUSTER:-cluster}" -v C="$COMPACT" \
+      -v PUE="$COST_PUE" -v KWH="$COST_KWH" -v CO2="$COST_CO2E" -v MILE="$COST_MILE" -v WATTS="$COST_WATTS" \
+      -v CPUS="$COST_CPUS" -v N1="$COST_RATE1_NAME" -v R1="$COST_RATE1" -v N2="$COST_RATE2_NAME" -v R2="$COST_RATE2" "$AWK_FN"'
+    function kv(s, a,   n, i, x, y) { n = split(s, x, " "); for (i = 1; i <= n; i++) { split(x[i], y, "="); a[y[1]] = y[2] + 0 } }
+    function kwh(x) { return x < 10 ? sprintf("%.1f kWh", x) : x < 10000 ? sprintf("%.0f kWh", x) : sprintf("%.1f MWh", x / 1000) }
+    function usd(x) { return x < 1000 ? sprintf("$%.2f", x) : sprintf("$%.0f", x) }
+    function kg(x) { return x < 10 ? sprintf("%.1f kg", x) : x < 10000 ? sprintf("%.0f kg", x) : sprintf("%.1f t", x / 1000) }
+    function mi(x) { return x < 10 ? sprintf("%.1f mi", x) : sprintf("%.0f mi", x) }
+    function row(l, e) { return sprintf("%-16s %9s %11s %8s %9s", l, kwh(e), usd(e * KWH), kg(e * CO2 / 1000), mi(e * CO2 / MILE)) }
+    function list(a,   t, s) { for (t in a) s = s (s != "" ? ", " : "") t; return s }
+    function mspan(a, b, j,   i, o) {   # a span of your own machines: the part inside each period
+      if (b <= a) return
+      for (i = 1; i <= NP; i++) {
+        o = (b < TNOW ? b : TNOW) - (a > MS[i] ? a : MS[i])
+        if (o > 0) { mj[i] += j * o / (b - a); ms[i] += o }
+      } }
+    BEGIN { FS = "|"; periods(W); kv(WATTS, PW); kv(R1, RA); kv(R2, RB)
+            NH = split(HL, x, " "); for (i = 1; i <= NH; i++) mine[x[i]] = 1
+            for (i = 1; i <= NP; i++) MS[i] = PS[i] + (PL[i] ~ /^last/ ? TNOW - NOW : 0) }   # "last ..." periods end now
+    /^@U$/ { s = 1; next }
+    /^@P$/ { s = 2; FS = " "; next }
+    /^@M$/ { s = 3; next }
+    s == 1 && $2 ~ /^[0-9]+$/ {   # a job: the part of its run inside each period
+      e = ($3 ~ /^[0-9]+$/) ? $3 : NOW; n = gpus($5)
+      for (i = 1; i <= NP; i++) {
+        b = ($2 > PS[i]) ? $2 : PS[i]; if (e <= b) continue
+        d = (e - b) / 3600; wh[i] += d * $4 * PW["cpu"]
+        if (!n) { c1[i] += d * $4 * RA["cpu"]; c2[i] += d * $4 * RB["cpu"]; continue }
+        if (!NT) { nopow["GPUs of no type"] = 1; noprice["GPUs of no type"] = 1 }
+        for (k = 1; k <= NT; k++) {
+          t = TY[k]; g = d * TN[k]
+          if (t in PW) wh[i] += g * PW[t]; else nopow[t] = 1
+          if ((t in RA) && (t in RB)) { c1[i] += g * RA[t]; c2[i] += g * RB[t] } else noprice[t] = 1
+        }
+      }
+      next }
+    s == 2 && NF == 5 && ($3 in mine) { mspan($1, $2, $4 + $5); next }   # a logged span
+    s == 2 && NF == 9 && ($1 in mine) { mspan($7, $2, $8 + $9); next }   # the span still open
+    s == 3 && /^#H / { h = $2; next }
+    s == 3 && /^#E / { m = $0; sub(/^#E( +[^ ]+){5} */, "", m); if (m != "" && !cpuw(m, 1)) nocpu[h] = 1; next }
+    END {
+      nr = (N1 != "") + (N2 != "")
+      printf "%s%-16s %9s %11s %8s %9s", D, toupper(CL), "ENERGY", "ELECTRICITY", "CO2e", "DRIVING"
+      if (N1 != "") printf " %9s", N1; if (N2 != "") printf " %9s", N2; print R
+      for (i = 1; i <= NP; i++) {
+        printf "%s", row(PL[i], wh[i] * PUE / 1000)
+        if (N1 != "") printf " %9s", usd(c1[i]); if (N2 != "") printf " %9s", usd(c2[i]); print ""
+      }
+      if (NH > 0) {
+        printf "%s%-16s %9s %11s %8s %9s %9s%s\n", D, "MY NODES", "ENERGY", "ELECTRICITY", "CO2e", "DRIVING", "MEASURED", R
+        for (i = 1; i <= NP; i++) {
+          f = ms[i] / ((TNOW - MS[i]) * NH); if (f > 1) f = 1
+          printf "%s %8.0f%%\n", row(PL[i], mj[i] / 3600000), 100 * f
+        }
+      }
+      if (C) exit
+      print D "energy: CPU cores and GPUs at rated power, times " PUE " for the data center (PUE)" R
+      printf "%s%.2f cents/kWh · %.0f kg CO2e/MWh · driving: %d g CO2e/mile · sources: slurmtop -h%s\n", D, KWH * 100, CO2, MILE, R
+      if (nr) print D (nr == 2 ? N1 " and " N2 : N1 N2) ": GPU jobs per GPU-hour, CPU-only jobs per core-hour" R
+      if (list(nopow) != "") print D "not in the energy: " list(nopow) " (rated power unknown)" R
+      if (nr && list(noprice) != "") print D "not priced: " list(noprice) " (no rate)" R
+      if (NH > 0) print D "my nodes: GPUs as measured, CPUs at rated power times their use (MEASURED: share of the period)" R
+      for (i = 1; i <= NH; i++) if (x[i] in nocpu) nc = nc (nc != "" ? ", " : "") x[i]
+      if (nc != "") print D "my nodes without their CPUs: " nc " (no rated power in COST_CPUS)" R
+    }'
+}
+
+# @@MYGPUS (see probe_nodes) -> a row per GPU of your own machines, and the power drawn now.
+node_lines() {
+  awk -v D="$FG_LBL" -v R="$R" -v G="$GRN" -v Y="$YEL" -v KWH="$COST_KWH" -v CO2="$COST_CO2E" '
+    /^#H / { h = $2; hosts[++nh] = h; p = 0; next }
+    /^#P$/ { p = 1; next }
+    h == "" { next }
+    !p && split($0, f, /, */) >= 8 && f[2] ~ /^[0-9]+$/ {
+      n++; host[n] = h; idx[n] = f[2]; name[n] = f[3]; sub(/^NVIDIA /, "", name[n]); use[n] = f[4]
+      mu[n] = f[5]; mt[n] = f[6]; pw[n] = f[7]; pl[n] = f[8]; got[h]++; at[h, f[1]] = n
+      if (f[7] ~ /^[0-9.]+$/) { watts += f[7]; ng++ }
+      next }
+    p && split($0, q, "|") >= 4 { k = at[h, q[1]]; if (k) procs[k] = procs[k] (procs[k] != "" ? ", " : "") q[3] " " q[4]; next }
+    !p && !(h in err) && NF && !/^\*\*/ { err[h] = $0 }   # what ssh or nvidia-smi said instead
+    END {
+      printf "%s%-8s %3s  %-10s %4s %16s %10s  %s%s\n", D, "HOST", "GPU", "MODEL", "USE", "MEMORY", "POWER", "PROCESSES", R
+      print "\037"   # STICKY
+      for (i = 1; i <= nh; i++) if (!got[hosts[i]]) printf "%-8s %s(not read: %s)%s\n", hosts[i], D, (hosts[i] in err) ? err[hosts[i]] : "no answer", R
+      for (k = 1; k <= n; k++) {
+        u = use[k] + 0; c = (u >= 50) ? G : (u > 0) ? Y : ""
+        printf "%-8s %3s  %-10s %s%3d%%%s %16s %10s  %s\n", (host[k] != host[k - 1] ? host[k] : ""), idx[k], substr(name[k], 1, 10), \
+          c, u, (c != "" ? R : ""), sprintf("%.1f/%.1f GiB", mu[k] / 1024, mt[k] / 1024), \
+          sprintf("%s/%.0f W", (pw[k] ~ /^[0-9.]+$/ ? sprintf("%.0f", pw[k]) : "?"), pl[k]), procs[k]
+      }
+      print "\036"   # FOOT
+      if (ng) printf "%snow:%s %.2f kW on %d GPUs %s·%s $%.2f an hour %s·%s %.2f kg CO2e an hour %s(GPUs only)%s\n", \
+        D, R, watts / 1000, ng, D, R, watts / 1000 * KWH, D, R, watts / 1000 * CO2 / 1000, D, R
+    }'
+}
+
+p_nodes() {  # panel 6: the GPUs of your own machines
+  box_top "${BOXC[6]}" "$(ptitle 6)" "nvidia-smi at each refresh"
+  if [ -n "$MYDATA" ]; then node_lines <<< "$MYDATA" | box_lines; else box_line "${FG_LBL}(reading…)$R"; fi
+  box_bottom "$HINT"
+}
+
+p_cost() {  # the third card of panel 2: what your cluster jobs and your own machines cost
+  box_top "${BOXC[8]}" "$(ptitle 2 "cost estimate")" "$COST_PLACE"
+  { echo "@U"; printf '%s\n' "$USAGE"; echo "@P"
+    if [ -n "$MYHOSTS" ] && plock; then cat "$PLOG" "$PSTATE" 2> /dev/null; punlock; fi
+    echo "@M"; printf '%s\n' "$MYDATA"; } | cost_lines "$WINDOWS" "$(date +%s)" "$MYHOSTS" | box_lines
   box_bottom "$HINT"
 }
 
@@ -697,7 +1060,7 @@ p_parts() {
   while IFS='|' read -r p v; do [ -n "$p" ] && mt[$p]=$v; done < <(awk -F'|' "$AWK_FN"'{print $1 "|" tlim($2)}' <<< "$PARTTIME")
   [ -n "$WINDOWS" ] && while IFS='|' read -r p v; do [ -n "$p" ] && mw[$p]=$v; done < <(wait_lines "${WINDOWS%% *}" <<< "$USAGE")
   [ -n "$PARTLIST" ] && box_line "$(printf '%s%-*s %-*s %7s %5s %10s %8s %8s %9s%s' "$FG_LBL" "$pw" PARTITION "$w" GPUS \
-    USED FREE "IDLE NODES" WAITING "MAX TIME" "YOUR WAIT" "$R")"
+    USED FREE "IDLE NODES" WAITING "MAX TIME" "YOUR WAIT" "$R")" && box_line "$STICKY"
   for part in $PARTLIST; do
     read -r n T U Dn I <<< "$(awk -v P="$part" '
       $0 ~ "Partitions=([^ ]*,)?"P"(,| |$)" {
@@ -750,8 +1113,8 @@ p_storage() {
   box_bottom "$HINT"
 }
 
-render() {  # render PANEL WIDTH [HINT]: the panel, WIDTH columns wide
-  local cols=$2 HINT=${3:-} part pw=9 w
+render() {  # render PANEL WIDTH: the panel, WIDTH columns wide (CURP tells box_top which panel it is)
+  local cols=$2 HINT="" CURP=$1 part pw=9 w
   for part in $PARTLIST; do (( ${#part} > pw )) && pw=${#part}; done   # partition name column
   (( pw > 20 )) && pw=20
   w=$(( cols - 61 - pw )); (( w > 50 )) && w=50; (( w < 10 )) && w=10   # leaves room for the text after the meters
@@ -763,68 +1126,258 @@ wide() {
   case "$1" in
     1) return 0 ;;
     2) (( ! COMPACT && (cols - 1) / 2 < 90 )) ;;
-    6) (( ! COMPACT && (cols - 1) / 2 < 88 )) ;;
+    6) (( ! COMPACT && (cols - 1) / 2 < 70 )) ;;
+    7) (( ! COMPACT && (cols - 1) / 2 < 88 )) ;;
+    8) (( ! COMPACT && (cols - 1) / 2 < 82 )) ;;
     *) return 1 ;;
   esac
 }
 
-# two_cols HINT PANEL...: the panels side by side in two columns, each added to the shorter
-# column; the shorter column's last panel is stretched so both end on the same line.
-two_cols() {
-  local hint=$1 i k cw gap hl=0 hr=0 lt="" rt="" pad rows target
-  local -a left=() right=() blk=() hgt=() L=() RR=()
-  shift
-  if (( $# == 1 )); then render "$1" "$cols" "$hint"; return; fi
-  cw=$(( (cols - 1) / 2 )); gap=$(( cols - 2 * cw ))
-  for i in "$@"; do
-    blk[i]=$(render "$i" "$cw"); hgt[i]=$(wc -l <<< "${blk[i]}")
-    if (( hl <= hr )); then left+=("$i"); hl=$(( hl + hgt[i] )); else right+=("$i"); hr=$(( hr + hgt[i] )); fi
+uncache() {  # uncache PANEL...: those panels are rendered again at the next draw
+  local k p
+  for k in "${!BLK[@]}"; do for p; do [[ ${k%%:*} == "$p" ]] && unset "BLK[$k]"; done; done
+  return 0
+}
+# cache PANEL WIDTH: the panel rendered into BLK[PANEL:WIDTH] unless it is there already, with
+# NAT, its height, and SCR, how many of its rows scroll.
+cache() {
+  local key="$1:$2" k n s=1 e m=0
+  local -a lines
+  [ -n "${BLK[$key]+x}" ] && return 0
+  BLK[$key]=$(render "$1" "$2")
+  mapfile -t lines <<< "${BLK[$key]}"
+  n=${#lines[@]}; e=$(( n - (COMPACT ? 0 : 1) ))   # the scrolled rows are lines s to e-1
+  for (( k = 1; k < n; k++ )); do
+    case ${lines[k]} in "$STICKY") s=$(( k + 1 )) m=$(( m + 1 )) ;; "$FOOT") e=$k m=$(( m + 1 )) ;; esac
   done
-  if [ -n "$hint" ]; then   # the key hint closes the last panel of the right column
-    target=${right[${#right[@]} - 1]}
-    hr=$(( hr - hgt[target] )); blk[target]=$(render "$target" "$cw" "$hint"); hgt[target]=$(wc -l <<< "${blk[target]}"); hr=$(( hr + hgt[target] ))
+  NAT[$key]=$(( n - m )) SCR[$key]=$(( e - s ))
+  return 0
+}
+
+# fit PANEL WIDTH HEIGHT [HINT]: the cached panel in exactly HEIGHT lines, into FITOUT. When its
+# rows do not all fit, those between its STICKY and FOOT lines scroll: OFF[PANEL] is the first one shown, and
+# the bottom line (in compact mode, the last line) says which are shown; FITMAX is the largest
+# offset and FITPAGE the rows shown. When they all fit, blank rows fill the space. HINT (the keys)
+# goes into the bottom line.
+fit() {
+  local p=$1 cols=$2 h=$3 hint=${4:-} BC=${BOXC[$1]} k nr off s=0 e label="" bottom="" up="↑" down="↓" dash="–"
+  local -a lines fixed=() rest=() tail=()
+  (( utf8 )) || up="^" down="v" dash="-"
+  (( p == FOCUS && ! once )) && [ -n "$FG_FOCUS" ] && BC=$FG_FOCUS
+  mapfile -t lines <<< "${BLK[$p:$cols]}"
+  FITOUT=${lines[0]}; lines=("${lines[@]:1}")
+  if (( ! COMPACT )); then bottom=${lines[${#lines[@]} - 1]}; unset "lines[${#lines[@]} - 1]"; fi
+  e=${#lines[@]}
+  for (( k = 0; k < ${#lines[@]}; k++ )); do
+    case ${lines[k]} in "$STICKY") fixed=("${lines[@]:0:k}"); s=$(( k + 1 )) ;; "$FOOT") e=$k ;; esac
+  done
+  rest=("${lines[@]:s:e-s}"); tail=("${lines[@]:e+1}")
+  nr=$(( h - 1 - ${#fixed[@]} - ${#tail[@]} - (COMPACT ? 0 : 1) ))   # the scrolled rows that fit
+  FITMAX=0
+  if (( ${#rest[@]} > nr )); then
+    (( COMPACT )) && nr=$(( nr - 1 ))   # the last line says which rows are shown
+    (( nr < 1 )) && nr=1
+    FITMAX=$(( ${#rest[@]} - nr ))
+    off=${OFF[p]:-0}; (( off > FITMAX )) && off=$FITMAX; (( off < 0 )) && off=0; OFF[p]=$off
+    (( off > 0 )) && label=$up
+    (( off < FITMAX )) && label+=$down
+    label+=" $(( off + 1 ))$( (( nr > 1 )) && printf '%s' "$dash$(( off + nr ))") of ${#rest[@]}"
+    rest=("${rest[@]:off:nr}")
+  else
+    OFF[p]=0
   fi
-  pad=$(( hl - hr )); target=${right[${#right[@]} - 1]}
-  (( pad < 0 )) && { pad=$(( -pad )); target=${left[${#left[@]} - 1]}; }
-  if (( pad > 0 )); then
-    rows=""
-    for (( k = 0; k < pad; k++ )); do
-      if (( COMPACT )); then rows+=$'\n'"$(printf '%*s' "$cw" '')"
-      else rows+=$'\n'"${BOXC[target]}$V$R$(printf '%*s' $(( cw - 2 )) '')${BOXC[target]}$V$R"; fi
+  FITPAGE=$nr
+  for k in "${fixed[@]}" "${rest[@]}" "${tail[@]}"; do FITOUT+=$'\n'$k; done
+  k=$(( 1 + ${#fixed[@]} + ${#rest[@]} + ${#tail[@]} + (COMPACT ? 0 : 1) )); [ -n "$label" ] && (( COMPACT )) && k=$(( k + 1 ))
+  for (( ; k < h; k++ )); do   # blank rows up to the height
+    if (( COMPACT )); then FITOUT+=$'\n'$(printf '%*s' "$cols" '')
+    else FITOUT+=$'\n'"$BC$V$R$(printf '%*s' $(( cols - 2 )) '')$BC$V$R"; fi
+  done
+  if (( COMPACT )); then
+    [ -n "$label" ] && FITOUT+=$'\n'$(fitc "   $FG_LBL$label$R" "$cols")
+  elif [ -n "$hint$label" ]; then FITOUT+=$'\n'$(box_bottom "$hint" "$label")
+  else FITOUT+=$'\n'$bottom
+  fi
+}
+
+# heights CAP MIN: each shown panel's height HT when none is taller than CAP and none shows
+# fewer than MIN of its scrolled rows (in compact mode, a cut panel takes a line more, to say which
+# rows are shown); the panels of a two-column group go to the shorter column (COLOF: 0 left,
+# 1 right); TOTAL is the screen height they take. Uses draw's items and W.
+heights() {
+  local cap=$1 min=$2 it p key hl hr low
+  TOTAL=0
+  for it in "${items[@]}"; do
+    hl=0 hr=0
+    for p in $it; do
+      key="$p:${W[$p]}"
+      low=$(( NAT[$key] - SCR[$key] + (SCR[$key] > min ? min + COMPACT : SCR[$key]) ))
+      HT[$p]=${NAT[$key]}; (( HT[$p] > cap )) && HT[$p]=$cap; (( HT[$p] < low )) && HT[$p]=$low
+      if (( hl <= hr )); then COLOF[$p]=0 hl=$(( hl + HT[$p] )); else COLOF[$p]=1 hr=$(( hr + HT[$p] )); fi
     done
-    if (( COMPACT )); then blk[target]+=$rows   # no frame: blank rows at the end
-    else blk[target]="${blk[target]%$'\n'*}$rows"$'\n'"${blk[target]##*$'\n'}"; fi   # empty rows above the bottom line
-  fi
-  for i in "${left[@]}"; do lt+="${blk[i]}"$'\n'; done
-  for i in "${right[@]}"; do rt+="${blk[i]}"$'\n'; done
-  mapfile -t L <<< "${lt%$'\n'}"; mapfile -t RR <<< "${rt%$'\n'}"
-  for (( k = 0; k < ${#L[@]} || k < ${#RR[@]}; k++ )); do
-    printf '%s%*s%s\n' "${L[k]:-$(printf '%*s' "$cw" '')}" "$gap" '' "${RR[k]:-}"
+    TOTAL=$(( TOTAL + (hl > hr ? hl : hr) ))
   done
 }
 
-draw() {
-  local i k n=0 hint="" two=0 group=""
-  local -a items=()
-  size
-  header
-  [ -n "$RESV" ] && maint_lines <<< "$RESV" | while IFS= read -r i; do printf '%s\n' "$(fitc "$i" "$cols")"; done
-  (( once )) || hint="1-5 panels · t theme · c compact · l layout · h help · q quit"
+draw() {  # the screen into SCREEN, and where each panel is on it into GEO (one "PANEL TOP BOTTOM LEFT RIGHT MAXOFF PAGE" each)
+  local i k p it hint="" two=0 group="" cw gap gs rows avail cap maxnat top r0 hl hr ph last
+  local -a items=() left right L RR col
+  local -A W=() HT=() COLOF=()
+  size; rows=$(tput lines 2>/dev/null || echo 40)
+  [[ $BLKSIG == "$DATAV $THEME $COMPACT" ]] || { BLK=() NAT=() SCR=(); BLKSIG="$DATAV $THEME $COMPACT"; }
+  # only the panels that lose or get the focus, or whose filters changed, are drawn again
+  [[ $BLKFOC == "$FOCUS" ]] || { uncache "$BLKFOC" "$FOCUS"; BLKFOC=$FOCUS; }
+  [[ $SIG1 == "$JF|$JT" ]] || { uncache 1; SIG1="$JF|$JT"; }
+  [[ $SIG2 == "$FF|$FT" ]] || { uncache 2 7; SIG2="$FF|$FT"; }
+  SCREEN=$(header "${QPID:+${YEL}updating…$R}"); GEO=(); top=2
+  if [ -n "$RESV" ]; then
+    while IFS= read -r i; do SCREEN+=$'\n'$(fitc "$i" "$cols"); top=$(( top + 1 )); done < <(maint_lines <<< "$RESV")
+  fi
+  (( once )) || hint="1-6 panels · Tab ↑↓ scroll · f / filter · t theme · c compact · l layout · h help · q quit"
+  [ -n "$PROMPT" ] && hint=$PROMPT
   case "$LAYOUT" in 2) two=1 ;; auto) (( cols >= 2 * COLMIN + 1 )) && two=1 ;; esac
+  cw=$(( (cols - 1) / 2 )); gap=$(( cols - 2 * cw )); printf -v gs '%*s' "$gap" ''
   # the screen as a list of items: one panel at full width, or a group of panels in two columns
-  for i in 1 2 6 3 4 5; do   # 6, the failed-jobs card, is shown with panel 2
-    (( ON[i == 6 ? 2 : i] )) || continue
-    (( i == 6 )) && [ -z "$WINDOWS" ] && continue
+  for i in 1 2 7 8 3 4 5 6; do   # 7 and 8, the failed-jobs and cost cards, are shown with panel 2
+    (( ON[i > 6 ? 2 : i] )) || continue
+    (( i > 6 )) && [ -z "$WINDOWS" ] && continue
+    (( i == 6 )) && [ -z "$MYHOSTS" ] && continue
     if (( two )) && ! wide "$i"; then group+=" $i"; continue; fi
     [ -n "$group" ] && items+=("$group"); group=""; items+=("$i")
   done
   [ -n "$group" ] && items+=("$group")
-  for k in "${!items[@]}"; do
-    n=$(( n + 1 ))
-    (( n == ${#items[@]} )) && HINT=$hint || HINT=""
-    if [[ ${items[k]} == " "* ]]; then two_cols "$HINT" ${items[k]}; else render "${items[k]}" "$cols" "$HINT"; fi
+  for it in "${items[@]}"; do   # a group of one is shown at full width
+    set -- $it
+    for p in $it; do if (( $# > 1 )); then W[$p]=$cw; else W[$p]=$cols; fi; cache "$p" "${W[$p]}"; done
   done
-  (( ${#items[@]} == 0 )) && [ -n "$hint" ] && printf '%s\n' "$(fitc "$FG_LBL(all panels hidden) · $hint$R" "$cols")"
+  # the tallest panels give up rows until all fit the window, each keeping three of its scrolled
+  # rows, or one in a short window (with --once, all is shown)
+  maxnat=0; for p in "${!W[@]}"; do (( NAT[$p:${W[$p]}] > maxnat )) && maxnat=${NAT[$p:${W[$p]}]}; done
+  avail=$(( rows - top + 1 - (COMPACT && ${#hint} ? 1 : 0) ))
+  for k in 3 1; do
+    cap=$maxnat; heights "$cap" "$k"
+    while (( ! once && TOTAL > avail && cap > 0 )); do cap=$(( cap - 1 )); heights "$cap" "$k"; done
+    (( once || TOTAL <= avail )) && break
+  done
+  # rows left over (a lower cap cuts every panel at it at once) go back to cut panels: at full
+  # width, or in a group's taller column (draw gives the shorter column's spare rows to its own)
+  i=$(( avail - TOTAL ))
+  for it in "${items[@]}"; do
+    (( i > 0 )) || break
+    hl=0 hr=0; for p in $it; do if (( COLOF[$p] )); then hr=$(( hr + HT[$p] )); else hl=$(( hl + HT[$p] )); fi; done
+    for p in $it; do
+      (( COLOF[$p] == (hr > hl) )) || continue
+      ph=$(( NAT[$p:${W[$p]}] - HT[$p] )); (( ph > i )) && ph=$i
+      (( ph > 0 )) && HT[$p]=$(( HT[$p] + ph )) i=$(( i - ph ))
+    done
+  done
+  for k in "${!items[@]}"; do
+    set -- ${items[k]}; last=$(( k == ${#items[@]} - 1 ))
+    if (( $# == 1 )); then
+      ph=""; (( last && ! COMPACT )) && ph=$hint
+      fit "$1" "$cols" "${HT[$1]}" "$ph"; SCREEN+=$'\n'$FITOUT
+      GEO+=("$1 $top $(( top + HT[$1] - 1 )) 1 $cols $FITMAX $FITPAGE"); top=$(( top + HT[$1] ))
+      continue
+    fi
+    left=() right=() hl=0 hr=0 L=() RR=()
+    for p in "$@"; do
+      if (( COLOF[$p] == 0 )); then left+=("$p"); hl=$(( hl + HT[$p] )); else right+=("$p"); hr=$(( hr + HT[$p] )); fi
+    done
+    # the shorter column's spare rows go first to its cut panels, then its last panel is
+    # stretched, so both columns end on the same line
+    if (( hl < hr )); then col=("${left[@]}") i=$(( hr - hl )); else col=("${right[@]}") i=$(( hl - hr )); fi
+    for p in "${col[@]}"; do
+      ph=$(( NAT[$p:$cw] - HT[$p] )); (( ph > i )) && ph=$i
+      (( ph > 0 )) && HT[$p]=$(( HT[$p] + ph )) i=$(( i - ph ))
+    done
+    p=${col[${#col[@]} - 1]}; HT[$p]=$(( HT[$p] + i ))
+    r0=$top
+    for p in "${left[@]}"; do
+      fit "$p" "$cw" "${HT[$p]}"; mapfile -t -O "${#L[@]}" L <<< "$FITOUT"
+      GEO+=("$p $r0 $(( r0 + HT[$p] - 1 )) 1 $cw $FITMAX $FITPAGE"); r0=$(( r0 + HT[$p] ))
+    done
+    r0=$top
+    for p in "${right[@]}"; do   # the key hint closes the last panel of the right column
+      ph=""; (( last && ! COMPACT )) && [[ $p == "${right[${#right[@]} - 1]}" ]] && ph=$hint
+      fit "$p" "$cw" "${HT[$p]}" "$ph"; mapfile -t -O "${#RR[@]}" RR <<< "$FITOUT"
+      GEO+=("$p $r0 $(( r0 + HT[$p] - 1 )) $(( cw + gap + 1 )) $cols $FITMAX $FITPAGE"); r0=$(( r0 + HT[$p] ))
+    done
+    for (( i = 0; i < ${#L[@]}; i++ )); do SCREEN+=$'\n'"${L[i]}$gs${RR[i]}"; done
+    top=$(( top + ${#L[@]} ))
+  done
+  if (( ${#items[@]} == 0 )); then [ -n "$hint" ] && SCREEN+=$'\n'$(fitc "$FG_LBL(all panels hidden) · $hint$R" "$cols")
+  elif (( COMPACT )) && [ -n "$hint" ]; then SCREEN+=$'\n'$(fitc "$FG_LBL$hint$R" "$cols")
+  fi
+  if (( ! once && TOTAL > avail )); then   # too short even for one row of each panel: cut at the window's end
+    mapfile -t L <<< "$SCREEN"
+    SCREEN=$(printf '%s\n' "${L[@]:0:rows-1}")$'\n'$(fitc "$FG_LBL(window too short: hide panels with 1-6, or c for compact)$R" "$cols")
+  fi
+}
+
+# Keys and mouse. read_seq reads the rest of an escape sequence (arrows, PgUp/PgDn, Home/End,
+# Shift+Tab, mouse) into SEQ, so that none of its characters is taken for a key of its own.
+read_seq() {
+  local c
+  SEQ=""
+  while IFS= read -rsn1 -t 0.05 c; do
+    SEQ+=$c
+    case $SEQ in
+      "[M") IFS= read -rsn3 -t 0.05 c; SEQ+=$c; break ;;   # older mouse reports: three raw bytes follow
+      O?) break ;;                                         # Home and End in some terminals
+      ?*[A-Za-z~]) break ;;
+    esac
+  done
+}
+panel_at() {  # panel_at X Y: the panel at screen column X and row Y into AT (empty when none)
+  local g p t b l r
+  AT=""
+  for g in "${GEO[@]}"; do
+    read -r p t b l r _ <<< "$g"
+    (( $2 >= t && $2 <= b && $1 >= l && $1 <= r )) && { AT=$p; return; }
+  done
+}
+scroll() {  # scroll PANEL STEP: STEP rows down (up when negative), page, -page, home or end
+  local g p="" mx=0 pg=1
+  for g in "${GEO[@]}"; do read -r p _ _ _ _ mx pg <<< "$g"; [[ $p == "$1" ]] && break; done
+  [[ $p == "$1" ]] || return 0
+  case $2 in
+    page) OFF[$1]=$(( OFF[$1] + pg )) ;; -page) OFF[$1]=$(( OFF[$1] - pg )) ;;
+    home) OFF[$1]=0 ;; end) OFF[$1]=$mx ;; *) OFF[$1]=$(( OFF[$1] + $2 )) ;;
+  esac
+  (( OFF[$1] > mx )) && OFF[$1]=$mx; (( OFF[$1] < 0 )) && OFF[$1]=0; return 0
+}
+focus_next() {  # focus_next STEP: the focus STEP panels on (back when negative), in screen order
+  local -a ps=()
+  local g i n
+  for g in "${GEO[@]}"; do ps+=("${g%% *}"); done
+  n=${#ps[@]}; (( n )) || return 0
+  for (( i = 0; i < n; i++ )); do [[ ${ps[i]} == "$FOCUS" ]] && break; done
+  (( i == n )) && i=$(( $1 > 0 ? -1 : 0 ))
+  FOCUS=${ps[ ((i + $1) % n + n) % n ]}
+}
+key_seq() {  # what an escape sequence (SEQ) does: scroll the focused panel, or, with the mouse, the panel under it
+  local s b x y kind
+  case $SEQ in
+    "[A"|OA) scroll "$FOCUS" -1 ;;
+    "[B"|OB) scroll "$FOCUS" 1 ;;
+    "[5~") scroll "$FOCUS" -page ;;
+    "[6~") scroll "$FOCUS" page ;;
+    "[H"|OH|"[1~"|"[7~") scroll "$FOCUS" home ;;
+    "[F"|OF|"[4~"|"[8~") scroll "$FOCUS" end ;;
+    "[Z") focus_next -1 ;;
+    "[<"*[Mm]) s=${SEQ#"[<"}; kind=${s: -1}; IFS=';' read -r b x y <<< "${s%?}" ;;
+    "[M"???) printf -v b '%d' "'${SEQ:2:1}"; printf -v x '%d' "'${SEQ:3:1}"; printf -v y '%d' "'${SEQ:4:1}"
+             b=$(( b - 32 )) x=$(( x - 32 )) y=$(( y - 32 )) kind=M ;;
+  esac
+  [ -n "${b:-}" ] || return 0
+  panel_at "$x" "$y"
+  [ -n "$AT" ] || return 0
+  case $b in
+    64) scroll "$AT" -3 ;;                  # wheel up
+    65) scroll "$AT" 3 ;;                   # wheel down
+    0) [ "$kind" = M ] && FOCUS=$AT ;;      # a click focuses the panel
+  esac
+  return 0
 }
 
 draw_help() {
@@ -832,9 +1385,12 @@ draw_help() {
   (( utf8 )) || on="[x]" off="[ ]"
   size
   box_top "${BOXC[1]}" "slurmtop help" "any key returns"
-  box_line "${B}keys$R  1-5 show or hide a panel · t next theme · c compact on/off · l layout · r refresh now · h help · q quit"
+  box_line "${B}keys$R  1-6 show or hide a panel · t next theme · c compact on/off · l layout · r refresh now · h help · q quit"
+  box_line "${B}scroll$R  Tab / Shift+Tab select a panel · ↑↓ PgUp PgDn Home End scroll it · mouse wheel scrolls the panel under it, a click selects it"
+  box_line "${B}filter$R  f state: my jobs running, pending · my usage completed, failed, cancelled  ·  / text in the ID, name, partition or node (Enter keeps it, Esc clears it)"
+  box_line "        ${FG_LBL}on the selected panel's jobs: my usage's finished jobs when it is selected, my jobs otherwise$R"
   box_line ""
-  for i in 1 2 3 4 5; do
+  for i in 1 2 3 4 5 6; do
     if (( ON[i] )); then mark="$GRN$on$R"; else mark="$FG_LBL$off$R"; fi
     box_line "$B$i$R $mark ${PNAME[i]%% (*}  $FG_LBL${PHELP[i]}$R"
   done
@@ -849,44 +1405,109 @@ draw_help() {
 
 load_settings
 apply_theme
-if (( logmode )); then
+if (( logmode )); then   # for cron: the energy of your own machines, and the daily line when it is due
+  if [ -n "$MYHOSTS" ]; then RAW=$(probe_nodes); MYDATA=$(section MYGPUS); power_sample; fi
+  log_due || exit 0
   query
   got WINDOWS || { echo "slurmtop: ${MYJOBS:-no answer from the cluster}" >&2; exit 1; }
   exit 0
 fi
-if (( once )); then query; draw; exit 0; fi
+if (( once )); then query; draw; printf '%s\n' "$SCREEN"; exit 0; fi
 HOME_=$(tput home 2>/dev/null) EL=$(tput el 2>/dev/null) ED=$(tput ed 2>/dev/null)
-trap 'tput cnorm 2>/dev/null; echo' EXIT
+MOUSE_ON=$'\e[?1000h\e[?1006h' MOUSE_OFF=$'\e[?1000l\e[?1006l'   # wheel and click reports (as in btop)
+TTY=""; [ -t 0 ] && TTY=$(stty -g 2>/dev/null)   # the terminal's settings, restored on exit
+QFILE=$(mktemp "${TMPDIR:-/tmp}/slurmtop.XXXXXX") || exit 1   # Slurm's answer to a background question
+cleanup() {  # on exit: the background question stopped, the terminal as it was
+  printf '%s' "$MOUSE_OFF"
+  [ -n "$QPID" ] && { pkill -P "$QPID"; kill "$QPID"; } 2> /dev/null
+  rm -f "$QFILE"
+  [ -n "$TTY" ] && stty "$TTY" 2> /dev/null; tput cnorm 2> /dev/null; echo
+}
+trap cleanup EXIT
 trap 'resized=1' WINCH
-tput civis 2>/dev/null; clear
+tput civis 2>/dev/null; clear; printf '%s' "$MOUSE_ON"
+# keys are read as they come and never echoed, also while the screen is drawn: an echoed mouse
+# report would be printed over the screen and scroll it
+[ -n "$TTY" ] && stty -echo -icanon min 1 time 0 2>/dev/null
 show() { printf '%s%s%s%s' "$HOME_" "${1//$'\n'/$EL$'\n'}" "$EL" "$ED"; }  # overwrite in place, clearing leftovers
 show_help() {
   local k
   while true; do
     resized=0; show "$(draw_help)"
-    while (( ! resized )); do
-      if read -rsn1 -t 1 k; then return; elif (( $? <= 128 )); then return; fi   # a key, or no keyboard
+    while (( ! resized )); do   # a key, or no keyboard, returns (an escape sequence is read whole)
+      if IFS= read -rsn1 -t 1 k; then [[ $k == $'\e' ]] && read_seq; return; elif (( $? <= 128 )); then return; fi
     done
   done
 }
+# Filters work on the job list of the selected panel: my usage's finished jobs when it (or its
+# failed-jobs card) is selected, and my jobs otherwise.
+cycle_filter() {  # f: the next state filter
+  if (( FOCUS == 2 || FOCUS == 7 )); then
+    case $FF in all) FF=completed ;; completed) FF=failed ;; failed) FF=cancelled ;; *) FF=all ;; esac; OFF[2]=0
+  else
+    case $JF in all) JF=running ;; running) JF=pending ;; *) JF=all ;; esac; OFF[1]=0
+  fi
+}
+edit_filter() {  # /: the text filter, applied as it is typed; Enter keeps it, Esc clears it
+  local p t k fin=0
+  if (( FOCUS == 2 || FOCUS == 7 )); then p=2 t=$FT; else p=1 t=$JT; fi
+  while true; do
+    if (( p == 1 )); then JT=$t; else FT=$t OFF[7]=0; fi
+    OFF[p]=0
+    (( fin )) && break
+    PROMPT="filter ${PNAME[p]}: $t▌ · Enter keeps it · Esc clears it"
+    draw; show "$SCREEN"
+    until IFS= read -rsn1 -t 0.2 k; do   # Slurm's answer may come meanwhile ($? is read's: > 128 on a timeout)
+      (( $? > 128 )) || { PROMPT=""; return; }   # no keyboard
+      answer && continue 2
+    done
+    while true; do   # this key, and those typed while the screen was drawn
+      case $k in
+        "") fin=1; break ;;                                          # Enter
+        $'\e') read_seq; [ -z "$SEQ" ] && { t="" fin=1; break; } ;;   # Esc alone (not an arrow key)
+        $'\x7f'|$'\b') t=${t%?} ;;
+        [[:print:]]) t+=$k ;;
+      esac
+      read -t 0 && IFS= read -rsn1 k || break
+    done
+  done
+  PROMPT=""
+}
+on_key() {  # on_key KEY: what a key does (force: ask Slurm now); fails for keys that do nothing
+  case "$1" in
+    $'\e') read_seq; key_seq ;;
+    $'\t') focus_next 1 ;;
+    q|Q) exit 0 ;;
+    r|R) force=1 ;;
+    f|F) cycle_filter ;;
+    /) edit_filter ;;
+    [1-6]) ON[$1]=$(( 1 - ON[$1] )); (( ON[$1] )) && case "$1" in 1|3|4|6) force=1 ;; esac; save_settings ;;
+    t|T) next_theme; apply_theme; save_settings ;;
+    c|C) COMPACT=$(( 1 - COMPACT )); save_settings ;;
+    l|L) case "$LAYOUT" in auto) LAYOUT=1 ;; 1) LAYOUT=2 ;; *) LAYOUT=auto ;; esac; save_settings ;;
+    h|H|'?') show_help ;;
+    *) return 1 ;;
+  esac
+}
+query   # the first answer is waited for
 resized=0
 while true; do
-  (( resized )) || query   # a resize only redraws; Slurm is asked on schedule, on r, or for a newly shown panel
+  query bg   # asks Slurm in the background when it is due
   resized=0
-  show "$(draw)"
-  # wait in 1 s steps so a resize is redrawn promptly (bash's read is not woken by SIGWINCH)
-  for (( t = 0; t < interval && ! resized; t++ )); do
-    (( force && t >= 5 )) && break
-    if read -rsn1 -t 1 key; then
-      case "$key" in
-        q|Q) exit 0 ;;
-        r|R) force=1 ;;
-        [1-5]) ON[key]=$(( 1 - ON[key] )); (( ON[key] )) && case "$key" in 1|3|4) force=1 ;; esac; save_settings ;;
-        t|T) next_theme; apply_theme; save_settings ;;
-        c|C) COMPACT=$(( 1 - COMPACT )); save_settings ;;
-        l|L) case "$LAYOUT" in auto) LAYOUT=1 ;; 1) LAYOUT=2 ;; *) LAYOUT=auto ;; esac; save_settings ;;
-        h|H|'?') show_help ;;
-      esac
+  draw; show "$SCREEN"
+  # wait for a key, a resize, Slurm's answer, the next redraw (every INTERVAL) or the next
+  # question, in steps of at most 1 s (bash's read is not woken by SIGWINCH)
+  left=$(( last_query + (force ? 5 : (interval > MIN_QUERY ? interval : MIN_QUERY)) - $(date +%s) ))
+  [ -z "$QPID" ] && (( left < interval )) || left=$interval
+  wake=$(( SECONDS + left ))
+  while (( ! resized )); do
+    answer && break
+    (( SECONDS >= wake )) && break
+    step=1; [ -n "$QPID" ] && step=0.1   # while Slurm answers, look for the answer often
+    if IFS= read -rsn1 -t "$step" key; then
+      on_key "$key" || continue   # other keys change nothing
+      # what came in meanwhile is handled before one redraw: a fast mouse wheel sends many reports
+      while read -t 0 && IFS= read -rsn1 key; do on_key "$key"; done
       break
     elif (( $? <= 128 )); then sleep 1  # no keyboard (input closed): wait instead of spinning
     fi
