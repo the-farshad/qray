@@ -58,9 +58,19 @@
 #               (770.884 lb/MWh)
 #   COST_MILE   g CO2e per mile driven by an average gasoline passenger vehicle: EPA Greenhouse
 #               Gas Equivalencies Calculator (October 2024 revision)
-#   COST_RATE1, COST_RATE2  your cluster's prices in dollars per core-hour and per GPU-hour of
-#               each GPU type, shown as columns named COST_RATE1_NAME and COST_RATE2_NAME (none
-#               by default)
+#   COST_RATES  your cluster's prices, a column each: "NAME: cpu=PRICE TYPE=PRICE ...; NAME: ...",
+#               in dollars per core-hour and per GPU-hour of each GPU type (none by default)
+#   COST_RENT_LOW, COST_RENT_HIGH  what renting the same from a cloud costs: the lowest and the
+#               highest on-demand list price found on the providers' own price pages (November 20,
+#               2026, in dollars), per GPU-hour of each GPU type (your own machines' GPUs by a word
+#               of their model name) and per CPU core-hour (a physical core of a 4th-generation AMD
+#               EPYC, the 9454's generation); a column each for the cluster, two each for your own
+#               machines. Lowest / highest: H100 SXM Massed Compute 3.14 / Azure ND96isr_H100_v5
+#               12.29; L40S Massed Compute 0.97 / Oracle 3.50; A30 Massed Compute 0.35 / E2E
+#               Networks 1.35; RTX A6000 Hyperstack 0.50 / Paperspace 1.89; RTX A5000 RunPod Secure
+#               Cloud 0.27 / Paperspace 1.38; T4 E2E Networks 0.45 / AWS g4dn.xlarge and Azure
+#               NC4as_T4_v3 0.526; CPU core Oracle E5 with 2 GB 0.034 / Google Cloud c3d-highcpu-4
+#               (two cores) 0.075. Also compared: AWS, Google Cloud, Lambda, CoreWeave, Jarvislabs.
 #   Your own machines count their GPUs' energy as measured and their CPUs at rated power times
 #   their measured use (as in Green Algorithms, Lannelongue et al., Advanced Science 2021), without
 #   PUE.
@@ -74,7 +84,9 @@ PLOG=${LOGF%/*}/power.tsv PSTATE=${LOGF%/*}/power.last
 COST_PLACE="U.S. average" COST_PUE=1.52 COST_KWH=0.1404 COST_CO2E=349.67 COST_MILE=393
 COST_WATTS="cpu=6.04 a30=165 l40s=350 h100=700 a6000=300 t4=70"
 COST_CPUS=""
-COST_RATE1_NAME="" COST_RATE1="" COST_RATE2_NAME="" COST_RATE2=""
+COST_RATES=""
+COST_RENT_LOW="cpu=0.034 h100=3.14 l40s=0.97 a30=0.35 a6000=0.50 a5000=0.27 t4=0.45"
+COST_RENT_HIGH="cpu=0.075 h100=12.29 l40s=3.50 a30=1.35 a6000=1.89 a5000=1.38 t4=0.526"
 
 interval=60 once=0 logmode=0
 for a in "$@"; do
@@ -671,15 +683,15 @@ section() { awk -v S="@@$1" '$0 == S {on = 1; next} /^@@[A-Z]+$/ {on = 0} on' <<
 
 # Your own machines (panel 6), read with nvidia-smi: probe_nodes prints @@MYGPUS and, for each
 # machine, "#H HOST TIME", its GPU lines ("BUS, INDEX, NAME, USE %, MEMORY USED MiB, MEMORY MiB,
-# POWER W, POWER LIMIT W"), "#P", a line per GPU process ("BUS|MEMORY MiB|USER|COMMAND"), and
-# "#E BOOT GPU-MJ CPU-BUSY CPU-ALL SOCKETS MODEL": when the machine started, the energy its GPUs
-# used since then (the driver's energy counters, read through NVML; "-" without them), the CPU
-# time since then (busy and all, in clock ticks), and its CPUs. The machines are read at the same
-# time, through ssh except this one.
+# POWER W, POWER LIMIT W"), "#P", a line per GPU process ("BUS|MEMORY MiB|USER|COMMAND|SECONDS
+# RUNNING"), and "#E BOOT GPU-MJ CPU-BUSY CPU-ALL SOCKETS MODEL": when the machine started, the
+# energy its GPUs used since then (the driver's energy counters, read through NVML; "-" without
+# them), the CPU time since then (busy and all, in clock ticks), and its CPUs. The machines are
+# read at the same time, through ssh except this one.
 MYPROBE='nvidia-smi --query-gpu=pci.bus_id,index,name,utilization.gpu,memory.used,memory.total,power.draw,power.limit --format=csv,noheader,nounits 2>&1
 echo "#P"
 nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_memory --format=csv,noheader,nounits 2>/dev/null |
-  while IFS=", " read -r b p m; do printf "%s|%s|%s|%s\n" "$b" "$m" "$(ps -o user= -p "$p")" "$(ps -o comm= -p "$p")"; done
+  while IFS=", " read -r b p m; do read -r u e c < <(ps -o user=,etimes=,comm= -p "$p"); printf "%s|%s|%s|%s|%s\n" "$b" "$m" "$u" "$c" "$e"; done
 e=$(python3 - 2> /dev/null <<"PY"
 import ctypes as c
 n = c.CDLL("libnvidia-ml.so.1"); k = c.c_uint(); s = 0
@@ -706,12 +718,17 @@ probe_nodes() {
   rmdir "$dir"
 }
 # The energy log of your own machines: PLOG has spans of time that were measured, of about an
-# hour each, as "START END HOST GPU-JOULES CPU-JOULES"; PSTATE has each machine's last reading and
-# the span still open, as "HOST TIME BOOT GPU-MJ CPU-BUSY CPU-ALL START GPU-JOULES CPU-JOULES".
+# hour each, as "START END HOST GPU-JOULES CPU-JOULES GPU-TIME"; PSTATE has each machine's last
+# reading and the span still open, as "HOST TIME BOOT GPU-MJ CPU-BUSY CPU-ALL START GPU-JOULES
+# CPU-JOULES", after "HOST GPU-TIME" for the span still open (a line of its own, which earlier
+# versions skip). GPU-TIME is "MODEL:SECONDS:IN-USE,..." for each GPU model: its GPU-seconds, and
+# those with a process on the GPU ("-": none).
 # The GPUs' energy counters give the energy between two readings however far apart they are, and
 # the first reading after a machine started also the energy since it started. GPUs without them
 # count the power of each reading for the time since the last one, when that is under two
 # refreshes. CPUs count at their rated power (COST_CPUS) times their use between the readings.
+# A GPU is in use from when the oldest process on it at a reading started; a process that
+# started and ended between two readings is missed.
 # Readings of any slurmtop, also of --log from cron, add up: each counts from the last one.
 plock() {  # takes the log's lock (for a moment); a lock left by an ended process is taken over
   local d="$PSTATE.lock" i p
@@ -729,35 +746,60 @@ power_sample() {  # the readings in MYDATA -> PLOG and PSTATE
   local out gap=$(( 2 * (interval > MIN_QUERY ? interval : MIN_QUERY) + 30 ))
   mkdir -p "${PLOG%/*}" 2> /dev/null && plock || return 0
   out=$({ [ -r "$PSTATE" ] && cat "$PSTATE"; echo "@@"; printf '%s\n' "$MYDATA"; } | awk -v GAP="$gap" -v CPUS="$COST_CPUS" "$AWK_FN"'
-    function span(h, a, b, g, c) { if (b > a) printf "L %.0f %.0f %s %.0f %.0f\n", a, b, h, g, c }
-    function shut(h) { span(h, ss[h], t0[h], gj[h], cj[h]); ss[h] = t0[h]; gj[h] = cj[h] = 0 }   # closes the open span
-    function since(h) {   # the first reading after the machine started: the energy since it started
-      if (G ~ /^[0-9]+$/ && T > B) span(h, B, T, G / 1000, (A > 0 ? Z / A : 0) * P * (T - B)) }
+    function span(h, a, b, g, c) { if (b > a) printf "L %.0f %.0f %s %.0f %.0f %s\n", a, b, h, g, c, gpt(h) }
+    function shut(h) { span(h, ss[h], t0[h], gj[h], cj[h]); ss[h] = t0[h]; gj[h] = cj[h] = 0; gclear(h) }   # closes the open span
+    function since(h) {   # the first reading after the machine started: the open span starts then
+      ss[h] = T; gj[h] = cj[h] = 0; gclear(h)
+      if (G ~ /^[0-9]+$/ && T > B) { ss[h] = B; gj[h] = G / 1000; cj[h] = (A > 0 ? Z / A : 0) * P * (T - B); gpu(h, T - B) } }
+    function gpu(h, L,   j, t, v, u) {   # the GPUs of this reading over the last L seconds, into the open span
+      for (j = 1; j <= ng[h]; j++) {
+        t = gt[h, j]; v = pe[h, gb[h, j]]   # how long the oldest process on it has run: "" none, "?" unknown
+        u = (v == "") ? 0 : (v != "?") ? (v + 0 < L ? v + 0 : L) : (L <= GAP ? L : 0)
+        if (!((h, t) in SA)) TL[h] = TL[h] " " t
+        SA[h, t] += L; SU[h, t] += u
+      } }
+    function gpt(h,   x, k, i, s) {   # the GPU time of the open span, as "MODEL:SECONDS:IN-USE,..." ("-": none)
+      k = split(TL[h], x, " ")
+      for (i = 1; i <= k; i++) s = s (s != "" ? "," : "") sprintf("%s:%.0f:%.0f", x[i], SA[h, x[i]], SU[h, x[i]])
+      return s != "" ? s : "-" }
+    function gclear(h,   x, k, i) { k = split(TL[h], x, " "); for (i = 1; i <= k; i++) { delete SA[h, x[i]]; delete SU[h, x[i]] }; TL[h] = "" }
+    function gload(h, s,   x, k, i, y) {
+      gclear(h); k = split(s, x, ",")
+      for (i = 1; i <= k; i++) if (split(x[i], y, ":") == 3) { TL[h] = TL[h] " " y[1]; SA[h, y[1]] = y[2]; SU[h, y[1]] = y[3] } }
     /^@@$/ { s = 1; next }
     !s && NF == 9 { h = $1; t0[h] = $2; bt[h] = $3; g0[h] = $4; b0[h] = $5; a0[h] = $6; ss[h] = $7; gj[h] = $8; cj[h] = $9
                     if (!(h in seen)) { seen[h] = 1; order[++n] = h }; next }
+    !s && NF == 2 { gload($1, $2); next }
     !s { next }
-    /^#H / { h = $2; tm[h] = $3; w[h] = 0; next }
+    /^#H / { h = $2; tm[h] = $3; w[h] = 0; ng[h] = 0; inp = 0; next }
+    /^#P$/ { inp = 1; next }
     /^#E / { if ($2 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/) { e[h] = $0; got[++m] = h }; next }
-    split($0, f, /, */) >= 8 && f[7] ~ /^[0-9.]+$/ { w[h] += f[7] }
+    inp { k = split($0, q, "|"); v = q[k]   # a process: the GPU it is on, and how long it has run
+          if (k >= 5 && v ~ /^[0-9]+$/) { if (pe[h, q[1]] !~ /^[0-9]+$/ || v + 0 > pe[h, q[1]] + 0) pe[h, q[1]] = v }
+          else if (k >= 5 && pe[h, q[1]] == "") pe[h, q[1]] = "?"
+          next }
+    split($0, f, /, */) >= 8 && f[2] ~ /^[0-9]+$/ {   # a GPU
+      if (f[7] ~ /^[0-9.]+$/) w[h] += f[7]
+      t = f[3]; sub(/^NVIDIA /, "", t); gsub(/ /, "_", t); gt[h, ++ng[h]] = t; gb[h, ng[h]] = f[1] }
     END {
       for (i = 1; i <= m; i++) {
         h = got[i]; split(e[h], x, " "); T = tm[h]; B = x[2]; G = x[3]; Z = x[4]; A = x[5]
         mo = e[h]; sub(/^#E( +[^ ]+){5} */, "", mo); P = cpuw(mo, x[6])
-        if (!(h in seen)) { seen[h] = 1; order[++n] = h; since(h); ss[h] = T; gj[h] = cj[h] = 0 }
+        if (!(h in seen)) { seen[h] = 1; order[++n] = h; since(h) }
         else if (T <= t0[h]) continue
-        else if (B - bt[h] > 60 || bt[h] - B > 60) { shut(h); since(h); ss[h] = T }   # restarted since: the rest is lost
+        else if (B - bt[h] > 60 || bt[h] - B > 60) { shut(h); since(h) }   # restarted since: the rest is lost
         else {
           dt = T - t0[h]; dg = -1
           if (G ~ /^[0-9]+$/ && g0[h] ~ /^[0-9]+$/ && G >= g0[h]) dg = (G - g0[h]) / 1000
           else if (dt <= GAP) dg = w[h] * dt
           if (dg < 0) { shut(h); ss[h] = T }   # not measured: the open span ends at the last reading
-          else { gj[h] += dg; cj[h] += (A > a0[h] && Z >= b0[h]) ? (Z - b0[h]) / (A - a0[h]) * P * dt : 0 }
+          else { gj[h] += dg; cj[h] += (A > a0[h] && Z >= b0[h]) ? (Z - b0[h]) / (A - a0[h]) * P * dt : 0; gpu(h, dt) }
         }
         t0[h] = T; bt[h] = B; g0[h] = G; b0[h] = Z; a0[h] = A
         if (int(T / 3600) != int(ss[h] / 3600)) shut(h)   # a new hour: a new span
       }
       for (i = 1; i <= n; i++) { h = order[i]
+        if (gpt(h) != "-") printf "S %s %s\n", h, gpt(h)
         printf "S %s %.0f %.0f %s %.0f %.0f %.0f %.0f %.0f\n", h, t0[h], bt[h], g0[h], b0[h], a0[h], ss[h], gj[h], cj[h] }
     }')
   if [ -n "$out" ]; then
@@ -938,28 +980,55 @@ p_failed() {  # the second card of panel 2; drawn only once Slurm accounting has
 # @U and the sacct rows of @@USAGE (as for period_lines), @P and the lines of PLOG and PSTATE (see
 # power_sample), then @M and @@MYGPUS -> for each period, the energy, electricity cost, emissions
 # and driving equivalent of your cluster jobs (CPU cores and GPUs at rated power, times the PUE),
-# and their price at COST_RATE1 and COST_RATE2 when these are set (GPU jobs per GPU-hour, CPU-only
-# jobs per core-hour); then the same for your own machines (the hosts in $3; the energy they used
-# as logged, no PUE), with the share of the period that was measured. $1 is the @@WINDOWS line,
-# $2 the time now (the periods of your own machines end then).
+# and their price at each price list of COST_RATES and at the lowest and highest cloud prices
+# (COST_RENT_LOW, COST_RENT_HIGH; GPU jobs per GPU-hour, CPU-only jobs per core-hour); then the
+# same for your own machines (the hosts in $3; the energy they used as logged, no PUE), with the
+# share of the period that was measured, and what renting their GPUs costs at the lowest and
+# highest cloud prices: for the time a process was on them, and for all the time measured. $1 is
+# the @@WINDOWS line, $2 the time now (the periods of your own machines end then).
 cost_lines() {
   awk -v D="$FG_LBL" -v R="$R" -v W="$1" -v TNOW="$2" -v HL="$3" -v CL="${CLUSTER:-cluster}" -v C="$COMPACT" \
       -v PUE="$COST_PUE" -v KWH="$COST_KWH" -v CO2="$COST_CO2E" -v MILE="$COST_MILE" -v WATTS="$COST_WATTS" \
-      -v CPUS="$COST_CPUS" -v N1="$COST_RATE1_NAME" -v R1="$COST_RATE1" -v N2="$COST_RATE2_NAME" -v R2="$COST_RATE2" "$AWK_FN"'
+      -v CPUS="$COST_CPUS" -v RATES="$COST_RATES" -v LOW="$COST_RENT_LOW" -v HIGH="$COST_RENT_HIGH" "$AWK_FN"'
     function kv(s, a,   n, i, x, y) { n = split(s, x, " "); for (i = 1; i <= n; i++) { split(x[i], y, "="); a[y[1]] = y[2] + 0 } }
+    function prices(s, cloud,   n, i, x, y, k, m, z, j, w) {   # "NAME: KEY=PRICE ...; ..." -> price list NK: name RN, prices RV[NK, KEY]
+      n = split(s, x, ";")
+      for (i = 1; i <= n; i++) {
+        if (split(x[i], y, ":") != 2) continue
+        k = ++NK; RN[k] = y[1]; gsub(/^ +| +$/, "", RN[k]); CLD[k] = cloud
+        m = split(y[2], z, " "); for (j = 1; j <= m; j++) if (split(z[j], w, "=") == 2) RV[k, w[1]] = w[2] + 0
+      } }
+    function mrate(k, t,   x, n, i) {   # the price in list k of a GPU model of your own machines: a word of its name is the key; -1 if none
+      n = split(tolower(t), x, /[_ -]+/)
+      for (i = 1; i <= n; i++) if ((k, x[i]) in RV) return RV[k, x[i]]
+      return -1 }
+    function nop(k, t) { if (!((k, t) in NOPS)) { NOPS[k, t] = 1; NPL[k] = NPL[k] (NPL[k] != "" ? ", " : "") t } }   # t has no price in list k
+    function mnop(t) { gsub(/_/, " ", t); if (!(t in MNOPS)) { MNOPS[t] = 1; MNP = MNP (MNP != "" ? ", " : "") t } }   # a GPU model of your own machines without a rent price
+    function names(   k, s) { for (k = 1; k <= NK; k++) s = s (k == 1 ? "" : k == NK ? " and " : ", ") RN[k]; return s }
     function kwh(x) { return x < 10 ? sprintf("%.1f kWh", x) : x < 10000 ? sprintf("%.0f kWh", x) : sprintf("%.1f MWh", x / 1000) }
     function usd(x) { return x < 1000 ? sprintf("$%.2f", x) : sprintf("$%.0f", x) }
     function kg(x) { return x < 10 ? sprintf("%.1f kg", x) : x < 10000 ? sprintf("%.0f kg", x) : sprintf("%.1f t", x / 1000) }
     function mi(x) { return x < 10 ? sprintf("%.1f mi", x) : sprintf("%.0f mi", x) }
     function row(l, e) { return sprintf("%-16s %9s %11s %8s %9s", l, kwh(e), usd(e * KWH), kg(e * CO2 / 1000), mi(e * CO2 / MILE)) }
     function list(a,   t, s) { for (t in a) s = s (s != "" ? ", " : "") t; return s }
-    function mspan(a, b, j,   i, o) {   # a span of your own machines: the part inside each period
+    function mspan(a, b, j, g,   i, o, n, x, q, y, k, r, c, u) {   # a span of your own machines: the part inside each period
       if (b <= a) return
+      n = split(g, x, ",")   # GPU time: MODEL:SECONDS:IN-USE; the time in use is the end of the span (as each reading counts it)
       for (i = 1; i <= NP; i++) {
-        o = (b < TNOW ? b : TNOW) - (a > MS[i] ? a : MS[i])
-        if (o > 0) { mj[i] += j * o / (b - a); ms[i] += o }
+        o = (b < TNOW ? b : TNOW) - (a > MS[i] ? a : MS[i]); if (o <= 0) continue
+        mj[i] += j * o / (b - a); ms[i] += o
+        for (q = 1; q <= n; q++) if (split(x[q], y, ":") == 3) {
+          c = y[2] / (b - a); u = (c > 0) ? y[3] / c : 0   # how many GPUs, and how long each was in use
+          u = (b < TNOW ? b : TNOW) - (b - u > MS[i] ? b - u : MS[i]); if (u < 0) u = 0
+          for (k = 1; k <= NK; k++) if (CLD[k]) {
+            r = mrate(k, y[1]); if (r < 0) { mnop(y[1]); continue }
+            PK[k] = 1; MU[i, k] += c * u * r / 3600; MA[i, k] += c * o * r / 3600
+          }
+        }
       } }
-    BEGIN { FS = "|"; periods(W); kv(WATTS, PW); kv(R1, RA); kv(R2, RB)
+    BEGIN { FS = "|"; periods(W); kv(WATTS, PW); prices(RATES, 0)
+            if (LOW != "") { prices("RENT LOW:" LOW, 1); LB[NK] = "LOW" }
+            if (HIGH != "") { prices("RENT HIGH:" HIGH, 1); LB[NK] = "HIGH" }
             NH = split(HL, x, " "); for (i = 1; i <= NH; i++) mine[x[i]] = 1
             for (i = 1; i <= NP; i++) MS[i] = PS[i] + (PL[i] ~ /^last/ ? TNOW - NOW : 0) }   # "last ..." periods end now
     /^@U$/ { s = 1; next }
@@ -970,41 +1039,52 @@ cost_lines() {
       for (i = 1; i <= NP; i++) {
         b = ($2 > PS[i]) ? $2 : PS[i]; if (e <= b) continue
         d = (e - b) / 3600; wh[i] += d * $4 * PW["cpu"]
-        if (!n) { c1[i] += d * $4 * RA["cpu"]; c2[i] += d * $4 * RB["cpu"]; continue }
-        if (!NT) { nopow["GPUs of no type"] = 1; noprice["GPUs of no type"] = 1 }
-        for (k = 1; k <= NT; k++) {
-          t = TY[k]; g = d * TN[k]
+        if (!n) { for (k = 1; k <= NK; k++) if ((k, "cpu") in RV) c[i, k] += d * $4 * RV[k, "cpu"]; else nop(k, "CPU-only jobs"); continue }
+        if (!NT) { nopow["GPUs of no type"] = 1; for (k = 1; k <= NK; k++) nop(k, "GPUs of no type") }
+        for (j = 1; j <= NT; j++) {
+          t = TY[j]; g = d * TN[j]
           if (t in PW) wh[i] += g * PW[t]; else nopow[t] = 1
-          if ((t in RA) && (t in RB)) { c1[i] += g * RA[t]; c2[i] += g * RB[t] } else noprice[t] = 1
+          for (k = 1; k <= NK; k++) if ((k, t) in RV) c[i, k] += g * RV[k, t]; else nop(k, t)
         }
       }
       next }
-    s == 2 && NF == 5 && ($3 in mine) { mspan($1, $2, $4 + $5); next }   # a logged span
-    s == 2 && NF == 9 && ($1 in mine) { mspan($7, $2, $8 + $9); next }   # the span still open
+    s == 2 && (NF == 5 || NF == 6) && ($3 in mine) { mspan($1, $2, $4 + $5, $6); next }   # a logged span
+    s == 2 && NF == 2 { og[$1] = $2; next }   # the GPU time of the span still open
+    s == 2 && NF == 9 && ($1 in mine) { mspan($7, $2, $8 + $9, og[$1]); next }   # the span still open
     s == 3 && /^#H / { h = $2; next }
     s == 3 && /^#E / { m = $0; sub(/^#E( +[^ ]+){5} */, "", m); if (m != "" && !cpuw(m, 1)) nocpu[h] = 1; next }
     END {
-      nr = (N1 != "") + (N2 != "")
       printf "%s%-16s %9s %11s %8s %9s", D, toupper(CL), "ENERGY", "ELECTRICITY", "CO2e", "DRIVING"
-      if (N1 != "") printf " %9s", N1; if (N2 != "") printf " %9s", N2; print R
+      for (k = 1; k <= NK; k++) printf " %9s", RN[k]; print R
       for (i = 1; i <= NP; i++) {
         printf "%s", row(PL[i], wh[i] * PUE / 1000)
-        if (N1 != "") printf " %9s", usd(c1[i]); if (N2 != "") printf " %9s", usd(c2[i]); print ""
+        for (k = 1; k <= NK; k++) printf " %9s", usd(c[i, k]); print ""
       }
       if (NH > 0) {
-        printf "%s%-16s %9s %11s %8s %9s %9s%s\n", D, "MY NODES", "ENERGY", "ELECTRICITY", "CO2e", "DRIVING", "MEASURED", R
+        printf "%s%-16s %9s %11s %8s %9s %9s", D, "MY NODES", "ENERGY", "ELECTRICITY", "CO2e", "DRIVING", "MEASURED"
+        for (k = 1; k <= NK; k++) if (PK[k]) { printf " %9s", "USE " LB[k]; np++ }   # the rent prices that have their GPU models:
+        for (k = 1; k <= NK; k++) if (PK[k]) printf " %9s", "ALL " LB[k]               # in use, and all the time
+        print R
         for (i = 1; i <= NP; i++) {
           f = ms[i] / ((TNOW - MS[i]) * NH); if (f > 1) f = 1
-          printf "%s %8.0f%%\n", row(PL[i], mj[i] / 3600000), 100 * f
+          printf "%s %8.0f%%", row(PL[i], mj[i] / 3600000), 100 * f
+          for (k = 1; k <= NK; k++) if (PK[k]) printf " %9s", usd(MU[i, k])
+          for (k = 1; k <= NK; k++) if (PK[k]) printf " %9s", usd(MA[i, k])
+          print ""
         }
       }
       if (C) exit
       print D "energy: CPU cores and GPUs at rated power, times " PUE " for the data center (PUE)" R
       printf "%s%.2f cents/kWh · %.0f kg CO2e/MWh · driving: %d g CO2e/mile · sources: slurmtop -h%s\n", D, KWH * 100, CO2, MILE, R
-      if (nr) print D (nr == 2 ? N1 " and " N2 : N1 N2) ": GPU jobs per GPU-hour, CPU-only jobs per core-hour" R
+      if (NK) print D names() ": GPU jobs per GPU-hour, CPU-only jobs per core-hour" R
+      if (LOW != "" || HIGH != "") print D "RENT: renting the same from a cloud, at the lowest and highest on-demand price found" R
       if (list(nopow) != "") print D "not in the energy: " list(nopow) " (rated power unknown)" R
-      if (nr && list(noprice) != "") print D "not priced: " list(noprice) " (no rate)" R
+      for (k = 1; k <= NK; k++) if (NPL[k] != "") {   # what has no price, once for the lists that lack the same
+        if (!(NPL[k] in GN)) GO[++ng] = NPL[k]; GN[NPL[k]] = GN[NPL[k]] (GN[NPL[k]] != "" ? " and " : "") RN[k] }
+      for (i = 1; i <= ng; i++) print D "not priced by " GN[GO[i]] ": " GO[i] R
       if (NH > 0) print D "my nodes: GPUs as measured, CPUs at rated power times their use (MEASURED: share of the period)" R
+      if (np) print D "my nodes rented: USE while a process ran on a GPU, ALL every GPU for the time measured" R
+      if (MNP != "") print D "my nodes not priced: " MNP " (no rent price)" R
       for (i = 1; i <= NH; i++) if (x[i] in nocpu) nc = nc (nc != "" ? ", " : "") x[i]
       if (nc != "") print D "my nodes without their CPUs: " nc " (no rated power in COST_CPUS)" R
     }'
@@ -1128,10 +1208,19 @@ wide() {
     2) (( ! COMPACT && (cols - 1) / 2 < 90 )) ;;
     6) (( ! COMPACT && (cols - 1) / 2 < 70 )) ;;
     7) (( ! COMPACT && (cols - 1) / 2 < 88 )) ;;
-    8) (( ! COMPACT && (cols - 1) / 2 < 82 )) ;;
+    8) (( ! COMPACT && (cols - 1) / 2 < COSTW )) ;;
     *) return 1 ;;
   esac
 }
+cost_width() {  # the width of the cost card, frame included: a column per price list, two per rent price for your own machines
+  local s n=0 r m=0 IFS=';'
+  r=$(( (${#COST_RENT_LOW} > 0) + (${#COST_RENT_HIGH} > 0) ))
+  for s in $COST_RATES; do [[ $s == *:* ]] && n=$(( n + 1 )); done
+  [ -n "$MYHOSTS" ] && m=$(( 67 + 20 * r ))
+  n=$(( 57 + 10 * (n + r) ))
+  echo $(( 5 + (n > m ? n : m) ))
+}
+COSTW=$(cost_width)
 
 uncache() {  # uncache PANEL...: those panels are rendered again at the next draw
   local k p
