@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# slurmtop [INTERVAL] [--once | --log]: live view of your Slurm jobs, how efficiently they run,
+# qray [INTERVAL] [--once | --log]: live view of your Slurm jobs, how efficiently they run,
 # their priority and queue wait, your usage, how busy the GPU partitions are, and your storage.
 #   INTERVAL: 1s to 1h, as 30, 30s, 5m or 1h (default 1m).
 #   --once: print one screen and exit.
@@ -17,30 +17,30 @@
 #   2 my usage*: CPU- and GPU-hours, finished-job efficiency, why jobs failed, cost estimate
 #   3 GPU partitions*: GPUs in use, jobs waiting, time limits, how long your jobs waited
 #   4 limits: accounts and QoS   5 storage*
-#   6 my nodes*: your own GPU machines (SLURMTOP_MYNODES): use, memory, power, processes
+#   6 my nodes*: your own GPU machines (QRAY_MYNODES): use, memory, power, processes
 # Layout: auto puts the panels in two columns when the window is at least 181 columns wide
 #   (each panel goes to the shorter column; my jobs keeps the full width, and my usage comes
 #   as two cards, usage and failed jobs, that take a column each when it is wide enough for
 #   their tables), and stacks them otherwise; l switches between auto, 1 and 2 columns.
 #   The panels fit the window height: the tallest give up rows first, and table headers stay.
 # Themes: default, nord, gruvbox, light (for light terminal backgrounds), mono.
-# Files: your panel, theme, compact and layout choices are kept in ~/.config/slurmtop/settings,
-#   and one line of usage a day is added to ~/.local/state/slurmtop/daily.tsv. The energy your
-#   own machines use is logged in ~/.local/state/slurmtop/power.tsv.
+# Files: your panel, theme, compact and layout choices are kept in ~/.config/qray/settings,
+#   and one line of usage a day is added to ~/.local/state/qray/daily.tsv. The energy your
+#   own machines use is logged in ~/.local/state/qray/power.tsv.
 # Light on the cluster: Slurm is asked at most every 30 s whatever the interval; accounting,
 #   storage, maintenance and limits every 10 min; hidden panels are not asked for, and the
 #   commands run at low priority (nice). Running-job efficiency is read every 5 min, only while
 #   my jobs is shown: a short step (cgroup counters and nvidia-smi) runs inside each running
 #   job, at most 16. Other users appear only as counts.
-# Runs on a cluster login node, or on any other machine through ssh (set SLURMTOP_HOST; one
+# Runs on a cluster login node, or on any other machine through ssh (set QRAY_HOST; one
 # shared connection is reused).
 # Settings (environment variables):
-#   SLURMTOP_HOST        ssh host to run the Slurm commands on, when Slurm is not installed here
-#   SLURMTOP_PARTITIONS  GPU partitions to show (default: those your accounts may use)
-#   SLURMTOP_ACCOUNT     account for the fair-share figure (default: all of yours)
-#   SLURMTOP_PATHS       paths on the cluster to show storage for; ~ and $USER are expanded
+#   QRAY_HOST            ssh host to run the Slurm commands on, when Slurm is not installed here
+#   QRAY_PARTITIONS      GPU partitions to show (default: those your accounts may use)
+#   QRAY_ACCOUNT         account for the fair-share figure (default: all of yours)
+#   QRAY_PATHS           paths on the cluster to show storage for; ~ and $USER are expanded
 #                        there (default: ~)
-#   SLURMTOP_MYNODES     your own GPU machines for panel 6: ssh host names, this machine by its
+#   QRAY_MYNODES         your own GPU machines for panel 6: ssh host names, this machine by its
 #                        name (hostname -s) (default: none)
 # Cost estimate (the cost card of panel 2): U.S. averages; change the COST_ values below for your
 # site. Sources (November 2026):
@@ -74,12 +74,12 @@
 #   Your own machines count their GPUs' energy as measured and their CPUs at rated power times
 #   their measured use (as in Green Algorithms, Lannelongue et al., Advanced Science 2021), without
 #   PUE.
-HOST=${SLURMTOP_HOST:-}
-MYHOSTS=${SLURMTOP_MYNODES:-}
+HOST=${QRAY_HOST:-}
+MYHOSTS=${QRAY_MYNODES:-}
 MIN_QUERY=30 SLOW_EVERY=600 LIVE_EVERY=300 LIVE_MAX=16
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/slurmtop-%C" -o ControlPersist=15m)
-CONF=${XDG_CONFIG_HOME:-$HOME/.config}/slurmtop/settings
-LOGF=${XDG_STATE_HOME:-$HOME/.local/state}/slurmtop/daily.tsv
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/qray-%C" -o ControlPersist=15m)
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/qray/settings
+LOGF=${XDG_STATE_HOME:-$HOME/.local/state}/qray/daily.tsv
 PLOG=${LOGF%/*}/power.tsv PSTATE=${LOGF%/*}/power.last
 COST_PLACE="U.S. average" COST_PUE=1.52 COST_KWH=0.1404 COST_CO2E=349.67 COST_MILE=393
 COST_WATTS="cpu=6.04 a30=165 l40s=350 h100=700 a6000=300 t4=70"
@@ -102,7 +102,7 @@ for a in "$@"; do
 done
 
 if ! command -v squeue > /dev/null && [ -z "$HOST" ]; then
-  echo "slurmtop: Slurm is not installed here; set SLURMTOP_HOST to an ssh host of your cluster" >&2
+  echo "qray: Slurm is not installed here; set QRAY_HOST to an ssh host of your cluster" >&2
   exit 1
 fi
 
@@ -114,7 +114,7 @@ PHELP=("" "your jobs: state, start estimates, how running jobs use CPU, memory a
   "GPUs in use, free and down, jobs waiting, time limits, your median wait, and why nodes are down" \
   "time and size limits of your accounts and QoS" \
   "space used on your storage paths" \
-  "your own GPU machines (SLURMTOP_MYNODES): use, memory, measured power and processes of each GPU")
+  "your own GPU machines (QRAY_MYNODES): use, memory, measured power and processes of each GPU")
 ON=(0 1 1 1 0 1 1)
 THEMES="default nord gruvbox light mono" THEME=default COMPACT=0 LAYOUT=auto COLMIN=90
 # Scrolling: panels are cut to fit the window; the rows between a panel's STICKY line (after its
@@ -150,7 +150,7 @@ save_settings() {
   local i list=""
   for i in 1 2 3 4 5 6; do (( ON[i] )) && list+="$i "; done
   mkdir -p "${CONF%/*}" 2>/dev/null && printf '%s\npanels=%s\npanelcount=6\ntheme=%s\ncompact=%s\nlayout=%s\n' \
-    "# slurmtop settings; slurmtop rewrites this file when you change them with its keys" \
+    "# qray settings; qray rewrites this file when you change them with its keys" \
     "${list% }" "$THEME" "$COMPACT" "$LAYOUT" > "$CONF"
 }
 next_theme() {
@@ -706,7 +706,7 @@ PY
 echo "#E $(awk "/^btime / {print \$2}" /proc/stat 2> /dev/null) ${e:--} $(awk "/^cpu / {b = \$2 + \$3 + \$4 + \$7 + \$8 + \$9; printf \"%.0f %.0f\", b, b + \$5 + \$6}" /proc/stat 2> /dev/null) $(awk -F ": " "/^physical id/ {p[\$2]} /^model name/ && m == \"\" {m = \$2} END {for (k in p) n++; print (n ? n : 1), m}" /proc/cpuinfo 2> /dev/null)"'
 probe_nodes() {
   local h t me dir
-  me=$(hostname -s 2> /dev/null); dir=$(mktemp -d "${TMPDIR:-/tmp}/slurmtop.XXXXXX") || return 0
+  me=$(hostname -s 2> /dev/null); dir=$(mktemp -d "${TMPDIR:-/tmp}/qray.XXXXXX") || return 0
   for h in $MYHOSTS; do
     if [ "$h" = "$me" ] || [ "$h" = localhost ]; then bash -c "$MYPROBE" > "$dir/$h" 2>&1 &
     else ssh -o ConnectTimeout=5 "${SSH[@]:1}" "$h" bash -s <<< "$MYPROBE" > "$dir/$h" 2>&1 &
@@ -729,7 +729,7 @@ probe_nodes() {
 # refreshes. CPUs count at their rated power (COST_CPUS) times their use between the readings.
 # A GPU is in use from when the oldest process on it at a reading started; a process that
 # started and ended between two readings is missed.
-# Readings of any slurmtop, also of --log from cron, add up: each counts from the last one.
+# Readings of any qray, also of --log from cron, add up: each counts from the last one.
 plock() {  # takes the log's lock (for a moment); a lock left by an ended process is taken over
   local d="$PSTATE.lock" i p
   for (( i = 0; i < 30; i++ )); do
@@ -876,8 +876,8 @@ query() {
     (( ON[6] )) && [ -n "$MYHOSTS" ] && mine=1   # your own machines are read at the same time
   fi
   (( once || logmode )) || [ "${1:-}" = bg ] || printf '%s%s%s' "$HOME_" "$(header "${YEL}updating…$R")" "$EL"  # keep the old screen, flag the wait
-  script=$(printf 'ACCOUNT=%q PARTS=%q PATHS=%q WANT=%q LIVE_MAX=%q\n' "${SLURMTOP_ACCOUNT:-}" "${SLURMTOP_PARTITIONS:-}" \
-    "${SLURMTOP_PATHS:-~}" "$want" "$LIVE_MAX"; printf '%s\n' "$COLLECT")
+  script=$(printf 'ACCOUNT=%q PARTS=%q PATHS=%q WANT=%q LIVE_MAX=%q\n' "${QRAY_ACCOUNT:-}" "${QRAY_PARTITIONS:-}" \
+    "${QRAY_PATHS:-~}" "$want" "$LIVE_MAX"; printf '%s\n' "$COLLECT")
   if [ "${1:-}" = bg ]; then
     if command -v squeue > /dev/null; then { nice -n 10 bash -c "$script" 2> /dev/null; (( mine )) && probe_nodes; } > "$QFILE" &
     else { "${SSH[@]}" "$HOST" nice -n 10 bash -s <<< "$script" 2>&1; (( mine )) && probe_nodes; } > "$QFILE" &
@@ -1075,7 +1075,7 @@ cost_lines() {
       }
       if (C) exit
       print D "energy: CPU cores and GPUs at rated power, times " PUE " for the data center (PUE)" R
-      printf "%s%.2f cents/kWh · %.0f kg CO2e/MWh · driving: %d g CO2e/mile · sources: slurmtop -h%s\n", D, KWH * 100, CO2, MILE, R
+      printf "%s%.2f cents/kWh · %.0f kg CO2e/MWh · driving: %d g CO2e/mile · sources: qray -h%s\n", D, KWH * 100, CO2, MILE, R
       if (NK) print D names() ": GPU jobs per GPU-hour, CPU-only jobs per core-hour" R
       if (LOW != "" || HIGH != "") print D "RENT: renting the same from a cloud, at the lowest and highest on-demand price found" R
       if (list(nopow) != "") print D "not in the energy: " list(nopow) " (rated power unknown)" R
@@ -1166,7 +1166,7 @@ p_parts() {
       box_line "${FG_LBL}(free GPUs can still be unusable if their node has no free CPUs or memory)$R"
     fi
   else
-    box_line "${FG_LBL}(no GPU partitions found; set SLURMTOP_PARTITIONS to choose some)$R"
+    box_line "${FG_LBL}(no GPU partitions found; set QRAY_PARTITIONS to choose some)$R"
   fi
   box_bottom "$HINT"
 }
@@ -1189,7 +1189,7 @@ p_storage() {
     [[ $pct =~ ^[0-9]+$ ]] || continue
     box_line "$(printf '%-*s %s %s of %s %s(%s%%)%s' "$n" "$path" "$(bar "$w" "$pct" 0 100)" "$used" "$sz" "$FG_LBL" "$pct" "$R")"
   done <<< "$STORAGE"
-  [ -n "$STORAGE" ] || box_line "${FG_LBL}(not read yet, or no path found; see SLURMTOP_PATHS)$R"
+  [ -n "$STORAGE" ] || box_line "${FG_LBL}(not read yet, or no path found; see QRAY_PATHS)$R"
   box_bottom "$HINT"
 }
 
@@ -1473,7 +1473,7 @@ draw_help() {
   local i mark on=● off=○
   (( utf8 )) || on="[x]" off="[ ]"
   size
-  box_top "${BOXC[1]}" "slurmtop help" "any key returns"
+  box_top "${BOXC[1]}" "qray help" "any key returns"
   box_line "${B}keys$R  1-6 show or hide a panel · t next theme · c compact on/off · l layout · r refresh now · h help · q quit"
   box_line "${B}scroll$R  Tab / Shift+Tab select a panel · ↑↓ PgUp PgDn Home End scroll it · mouse wheel scrolls the panel under it, a click selects it"
   box_line "${B}filter$R  f state: my jobs running, pending · my usage completed, failed, cancelled  ·  / text in the ID, name, partition or node (Enter keeps it, Esc clears it)"
@@ -1498,14 +1498,14 @@ if (( logmode )); then   # for cron: the energy of your own machines, and the da
   if [ -n "$MYHOSTS" ]; then RAW=$(probe_nodes); MYDATA=$(section MYGPUS); power_sample; fi
   log_due || exit 0
   query
-  got WINDOWS || { echo "slurmtop: ${MYJOBS:-no answer from the cluster}" >&2; exit 1; }
+  got WINDOWS || { echo "qray: ${MYJOBS:-no answer from the cluster}" >&2; exit 1; }
   exit 0
 fi
 if (( once )); then query; draw; printf '%s\n' "$SCREEN"; exit 0; fi
 HOME_=$(tput home 2>/dev/null) EL=$(tput el 2>/dev/null) ED=$(tput ed 2>/dev/null)
 MOUSE_ON=$'\e[?1000h\e[?1006h' MOUSE_OFF=$'\e[?1000l\e[?1006l'   # wheel and click reports (as in btop)
 TTY=""; [ -t 0 ] && TTY=$(stty -g 2>/dev/null)   # the terminal's settings, restored on exit
-QFILE=$(mktemp "${TMPDIR:-/tmp}/slurmtop.XXXXXX") || exit 1   # Slurm's answer to a background question
+QFILE=$(mktemp "${TMPDIR:-/tmp}/qray.XXXXXX") || exit 1   # Slurm's answer to a background question
 cleanup() {  # on exit: the background question stopped, the terminal as it was
   printf '%s' "$MOUSE_OFF"
   [ -n "$QPID" ] && { pkill -P "$QPID"; kill "$QPID"; } 2> /dev/null

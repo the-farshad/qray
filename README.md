@@ -1,10 +1,10 @@
-# slurmtop
+# Qray
 
 A single-file Bash dashboard for your Slurm jobs, how efficiently they run, their priority
 and queue wait, your usage and what it costs, how busy the GPU partitions are, your storage,
 and your own GPU machines, refreshed live in the terminal.
 
-![slurmtop screenshot](screenshot.png)
+![Qray screenshot](screenshot.png)
 
 ## Features
 
@@ -17,7 +17,7 @@ Six panels, each shown or hidden with its number key, like in `btop`:
 | `3` | GPU partitions | yes | GPUs used, down, and free, idle nodes, how many jobs are waiting (other users' jobs appear only as counts), the time limit, the median time your jobs waited to start there in the last 30 days, and why nodes are down or draining |
 | `4` | limits | no | Limits of your accounts, and the time and size limits of the QoS they may use |
 | `5` | storage | yes | Space used on the paths you choose |
-| `6` | my nodes | yes, when set | Your own GPU machines (`SLURMTOP_MYNODES`): each GPU's use, memory, measured power, and processes, and the power they draw now |
+| `6` | my nodes | yes, when set | Your own GPU machines (`QRAY_MYNODES`): each GPU's use, memory, measured power, and processes, and the power they draw now |
 
 When the window is too narrow for the whole jobs table, its least needed columns (expected
 start, time limit, partition, and so on) are left out.
@@ -56,27 +56,27 @@ Also:
 ## Install
 
 ```sh
-curl -fsSLo slurmtop https://raw.githubusercontent.com/the-farshad/slurmtop/main/slurmtop
-chmod +x slurmtop
-./slurmtop
+curl -fsSLo qray https://raw.githubusercontent.com/the-farshad/qray/main/qray
+chmod +x qray
+./qray
 ```
 
 Or clone the repo and place the script on your `PATH`:
 
 ```sh
-git clone https://github.com/the-farshad/slurmtop.git
-cp slurmtop/slurmtop ~/.local/bin/
+git clone https://github.com/the-farshad/qray.git
+cp qray/qray ~/.local/bin/
 ```
 
 ## Usage
 
 ```sh
-slurmtop              # live view, refreshed every minute
-slurmtop 30s          # refresh every 30 seconds
-slurmtop 5m           # refresh every 5 minutes
-slurmtop --once       # print one screen and exit
-slurmtop --log        # log your own machines' energy, add the daily log line if due, and exit
-slurmtop -h           # show help
+qray              # live view, refreshed every minute
+qray 30s          # refresh every 30 seconds
+qray 5m           # refresh every 5 minutes
+qray --once       # print one screen and exit
+qray --log        # log your own machines' energy, add the daily log line if due, and exit
+qray -h           # show help
 ```
 
 The interval can be 1 second to 1 hour, written as `30`, `30s`, `5m`, or `1h`. Shorter
@@ -119,16 +119,16 @@ use, such as `1 my jobs · running · "gpu-h100"`. A filtered list of finished j
 jobs of the month that match, including those that ended before they started.
 
 Your panel, theme, compact, and layout choices are saved in
-`~/.config/slurmtop/settings` (or `$XDG_CONFIG_HOME/slurmtop/settings`) and used the next
+`~/.config/qray/settings` (or `$XDG_CONFIG_HOME/qray/settings`) and used the next
 time.
 
 ### From your own computer
 
-When Slurm is not installed locally, point `SLURMTOP_HOST` at a login node, either a host
+When Slurm is not installed locally, point `QRAY_HOST` at a login node, either a host
 name or a `Host` alias from `~/.ssh/config`:
 
 ```sh
-SLURMTOP_HOST=login.mycluster.example slurmtop
+QRAY_HOST=login.mycluster.example qray
 ```
 
 The ssh connection is opened once and kept for 15 minutes, so later refreshes are quick.
@@ -207,14 +207,14 @@ How it is counted:
 
 ### Your own GPU machines
 
-Set `SLURMTOP_MYNODES` to the ssh host names of your own GPU machines, and this machine by its
+Set `QRAY_MYNODES` to the ssh host names of your own GPU machines, and this machine by its
 name (`hostname -s`); they are read at each refresh, at the same time and in the background:
 
 ```sh
-export SLURMTOP_MYNODES="gpu1 gpu2 $(hostname -s)"
+export QRAY_MYNODES="gpu1 gpu2 $(hostname -s)"
 ```
 
-The energy they use is logged in `~/.local/state/slurmtop/power.tsv`, in spans of about an
+The energy they use is logged in `~/.local/state/qray/power.tsv`, in spans of about an
 hour, for the cost card, as `START END HOST GPU-JOULES CPU-JOULES GPU-TIME` (times in epoch
 seconds; `GPU-TIME` is `MODEL:SECONDS:IN-USE` for each GPU model, in GPU-seconds):
 
@@ -238,29 +238,29 @@ seconds; `GPU-TIME` is `MODEL:SECONDS:IN-USE` for each GPU model, in GPU-seconds
   reading started, so a process that starts and ends between two readings is missed, and the
   first reading after a machine started finds only the processes running then.
 
-Every slurmtop that runs adds its readings, and `slurmtop --log` from cron adds one each time
-it runs, so the log keeps going when no slurmtop is open; each reading counts from the last
-one, whichever slurmtop took it. Every hour is enough:
+Every Qray that runs adds its readings, and `qray --log` from cron adds one each time
+it runs, so the log keeps going when no Qray is open; each reading counts from the last
+one, whichever Qray took it. Every hour is enough:
 
 ```
-0 * * * * SLURMTOP_MYNODES="gpu1 gpu2 mymachine" /path/to/slurmtop --log
+0 * * * * QRAY_MYNODES="gpu1 gpu2 mymachine" /path/to/qray --log
 ```
 
 ### Daily log
 
-Whenever slurmtop reads Slurm accounting and the last log line is 23 hours old or more, it
-adds a line to `~/.local/state/slurmtop/daily.tsv` (or `$XDG_STATE_HOME/slurmtop/daily.tsv`).
+Whenever Qray reads Slurm accounting and the last log line is 23 hours old or more, it
+adds a line to `~/.local/state/qray/daily.tsv` (or `$XDG_STATE_HOME/qray/daily.tsv`).
 The file is tab-separated with a header row, so it opens in a spreadsheet. Each line covers
 the 24 hours before its time: CPU-hours, GPU-hours (also by GPU type), jobs that ran, jobs
 that ended by state, how much of the allocated CPU time, requested memory, and time limit
 those jobs used, and your fair-share and storage at that time.
 
-Lines are written only while slurmtop runs. To log every day without it, run
-`slurmtop --log` from cron, for example at 23:50; it asks Slurm only when a line is due, so
+Lines are written only while Qray runs. To log every day without it, run
+`qray --log` from cron, for example at 23:50; it asks Slurm only when a line is due, so
 it can also run every hour (as above):
 
 ```
-50 23 * * * SLURMTOP_HOST=mycluster /path/to/slurmtop --log
+50 23 * * * QRAY_HOST=mycluster /path/to/qray --log
 ```
 
 ## Light on the cluster
@@ -284,18 +284,18 @@ All settings are environment variables:
 
 | Variable              | Default                                     | Description                                                     |
 |-----------------------|---------------------------------------------|-----------------------------------------------------------------|
-| `SLURMTOP_HOST`       | none (Slurm on this machine)                | ssh host to run the Slurm commands on                           |
-| `SLURMTOP_PARTITIONS` | GPU partitions your accounts and groups may use | Space-separated GPU partitions to show                       |
-| `SLURMTOP_ACCOUNT`    | all of your accounts                        | Account to show the fair-share of                               |
-| `SLURMTOP_PATHS`      | `~`                                         | Space-separated paths on the cluster to show storage for; `~` and `$USER` are expanded on the cluster |
-| `SLURMTOP_MYNODES`    | none                                        | Your own GPU machines for panel 6: ssh host names, and this machine by its name |
+| `QRAY_HOST`           | none (Slurm on this machine)                | ssh host to run the Slurm commands on                           |
+| `QRAY_PARTITIONS`     | GPU partitions your accounts and groups may use | Space-separated GPU partitions to show                       |
+| `QRAY_ACCOUNT`        | all of your accounts                        | Account to show the fair-share of                               |
+| `QRAY_PATHS`          | `~`                                         | Space-separated paths on the cluster to show storage for; `~` and `$USER` are expanded on the cluster |
+| `QRAY_MYNODES`        | none                                        | Your own GPU machines for panel 6: ssh host names, and this machine by its name |
 
 Example, for a shell startup file:
 
 ```sh
-export SLURMTOP_HOST=mycluster
-export SLURMTOP_PARTITIONS="gpu-a100 gpu-h100"
-export SLURMTOP_PATHS='~ /scratch/$USER'
+export QRAY_HOST=mycluster
+export QRAY_PARTITIONS="gpu-a100 gpu-h100"
+export QRAY_PATHS='~ /scratch/$USER'
 ```
 
 ## Notes
